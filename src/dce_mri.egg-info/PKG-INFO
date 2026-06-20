@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: dce_mri
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: numpy>=2.3
+Requires-Dist: scipy>=1.16
+Requires-Dist: nibabel
+Requires-Dist: matplotlib>=3.10
+Requires-Dist: pandas
+Requires-Dist: scikit-learn>=1.8
+Requires-Dist: lmfit>=1.3
+Requires-Dist: sympy
+Requires-Dist: tqdm
+Requires-Dist: joblib
+Requires-Dist: dill
+Requires-Dist: networkx
+Requires-Dist: pillow
+Requires-Dist: hdbscan
+Requires-Dist: umap-learn
+Requires-Dist: uncertainties
+Requires-Dist: numba
+Requires-Dist: jax
+Requires-Dist: torch
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ipykernel; extra == "dev"
+Requires-Dist: jupyter; extra == "dev"
+Requires-Dist: spyder-kernels; extra == "dev"
