@@ -40,10 +40,12 @@ from dce_mri.config import (
     AcquisitionConfig,
     SubjectConfig,
     FittingConfig,
+    FitModeConfig,
     VoxelwiseConfig,
     VoxelwiseResult,
 )
 from dce_mri.kinetic_models import KineticModelSpec
+from dce_mri.fitting import call_fitter
 
 
 # =============================================================================
@@ -60,6 +62,7 @@ def run_voxelwise_fitting(
     fitting_cfg:  FittingConfig,
     voxelwise_cfg: VoxelwiseConfig,
     mask:         Optional[np.ndarray] = None,
+    fit_mode_cfg:  FitModeConfig        = FitModeConfig(),
 ) -> VoxelwiseResult:
     """
     Fit kinetic model to every masked voxel in a 4D volume, in parallel.
@@ -109,13 +112,96 @@ def run_voxelwise_fitting(
     8. Log progress, QC plots for first n_qc_plots successful voxels
     9. Return VoxelwiseResult
     """
-    raise NotImplementedError
+    t_start = time.time()
+
+    # ── Build mask ────────────────────────────────────────────────────
+    if mask is None:
+        baseline = sig_4d[..., acq.nbase].mean(axis=-1)
+        mask = baseline > np.percentile(baseline, 10)
+    
+    coords    = np.argwhere(mask)
+    n_voxels  = len(coords)
+    n_workers = voxelwise_cfg.n_workers or max(1, cpu_count() - 1)
+    chunk_size = voxelwise_cfg.chunk_size or max(1, n_voxels // n_workers)
+    
+    chunks = _build_chunks(coords, chunk_size)
+    
+    args_list = [
+        {
+            "coords":       chunk,
+            "sig_4d":       sig_4d,
+            "aif":          aif,
+            "time_var":     time_var,
+            "model":        model,
+            "acq":          acq,
+            "subject":      subject,
+            "fitting_cfg":  fitting_cfg,
+            "fit_mode_cfg": fit_mode_cfg,
+        }
+        for chunk in chunks
+    ]
+    
+    print(f"[volume] fitting {n_voxels} voxels "
+          f"({len(chunks)} chunks, {n_workers} workers, "
+          f"chunk_size={chunk_size}) ...")
+    
+    with Pool(n_workers) as pool:
+        chunk_results = pool.map(_process_chunk, args_list)
+    
+    all_results = [r for chunk in chunk_results for r in chunk]
+    
+    # ── Build output maps ─────────────────────────────────────────────
+    shape_3d   = sig_4d.shape[:3]
+    
+    if fit_mode_cfg.mode == "dispersed":
+        from dce_mri.kinetic_models import DISPERSED_GKM
+        current_param_names = DISPERSED_GKM.param_names
+    else:
+        current_param_names = model.param_names
+
+    param_maps = {name: np.zeros(shape_3d) for name in current_param_names}
+    cost_map    = np.zeros(shape_3d)
+    success_map = np.zeros(shape_3d, dtype=bool)
+    
+    if fit_mode_cfg.mode == "dispersed":
+        param_maps["best_level"] = np.zeros(shape_3d)
+    elif fit_mode_cfg.mode in ("delay_grid", "delay_continuous"):
+        param_maps["best_tau"] = np.zeros(shape_3d)
+    
+    n_success = 0
+    for r in all_results:
+        i, j, k = r["coord"]
+        for pi, name in enumerate(current_param_names):
+            param_maps[name][i, j, k] = r["params"][pi]
+        cost_map[i, j, k]    = r["cost"]
+        success_map[i, j, k] = r["success"]
+        if r["success"]:
+            n_success += 1
+        
+        # extra keys
+        if "best_level" in r:
+            param_maps["best_level"][i, j, k] = r["best_level"]
+        if "best_tau" in r:
+            param_maps["best_tau"][i, j, k] = r["best_tau"]
+    
+    elapsed = time.time() - t_start
+    print(f"[volume] done — {n_success}/{n_voxels} successful "
+          f"in {elapsed:.1f}s")
+    
+    return VoxelwiseResult(
+        param_maps  = param_maps,
+        cost_map    = cost_map,
+        success_map = success_map,
+        n_voxels    = n_voxels,
+        n_success   = n_success,
+        elapsed_s   = elapsed,
+    )
+   
 
 
 # =============================================================================
 # Public: NIfTI I/O
 # =============================================================================
-
 def save_nifti_maps(
     result:  VoxelwiseResult,
     ref_img: nib.Nifti1Image,
@@ -123,15 +209,22 @@ def save_nifti_maps(
 ) -> None:
     """
     Save each parameter map in result.param_maps as a NIfTI file.
-
-    Output filenames: {cfg.save_dir}/{cfg.output_prefix}{param_name}.nii.gz
     Also saves cost_map and success_map.
-
-    TODO: loop over result.param_maps items and save with nibabel,
-          matching affine and header from ref_img
     """
-    raise NotImplementedError
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    affine = ref_img.affine
+    header = ref_img.header
 
+    maps_to_save = dict(result.param_maps)
+    maps_to_save["cost"]    = result.cost_map
+    maps_to_save["success"] = result.success_map.astype(np.float32)
+
+    for name, data in maps_to_save.items():
+        fname = os.path.join(cfg.save_dir,
+                             f"{cfg.output_prefix}{name}.nii.gz")
+        nib.save(nib.Nifti1Image(data.astype(np.float32), affine, header),
+                 fname)
+        print(f"[volume] saved {fname}")
 
 def load_nifti_canonical(
     path: str,
@@ -176,10 +269,9 @@ def _build_chunks(
     Returns list of np.ndarray, each of shape (chunk_size, 3) except
     possibly the last chunk which may be smaller.
 
-    TODO: np.array_split(coords, max(1, len(coords) // chunk_size))
     """
-    raise NotImplementedError
-
+    n_chunks = max(1, len(coords) // chunk_size)
+    return np.array_split(coords, n_chunks)
 
 def _process_chunk(args: dict) -> list[dict]:
     """
@@ -202,15 +294,37 @@ def _process_chunk(args: dict) -> list[dict]:
     This function is called by multiprocessing.Pool — it must be
     importable at the top level (no lambdas or nested functions as args).
 
-    TODO:
-    1. Unpack args
-    2. from dce_mri.fitting import fit_single_voxel
-    3. for coord in args['coords']:
-           i, j, k = coord
-           sig_v = args['sig_4d'][i, j, k, :]
-           result = fit_single_voxel(sig_v, aif, time_var, model,
-                                      acq, subject, fitting_cfg)
-           results.append({'coord': coord, 'params': result.params, ...})
-    4. return results
     """
-    raise NotImplementedError
+
+
+    coords      = args["coords"]
+    sig_4d      = args["sig_4d"]
+    aif         = args["aif"]
+    time_var    = args["time_var"]
+    model       = args["model"]
+    acq         = args["acq"]
+    subject     = args["subject"]
+    fitting_cfg = args["fitting_cfg"]
+    fit_mode_cfg= args["fit_mode_cfg"]
+    
+    n_params = (len(model.param_names) if fit_mode_cfg.mode != "dispersed"
+               else 4)
+    
+    results = []
+    for coord in coords:
+        i, j, k = int(coord[0]), int(coord[1]), int(coord[2])
+        sig_v = sig_4d[i, j, k, :]
+        
+        voxel_seed = hash((i, j, k)) % (2**31)   # deterministic per-voxel seed
+        
+        try:
+            flat = call_fitter(sig_v, aif, time_var, model, acq,
+                              subject, fitting_cfg, fit_mode_cfg, seed=voxel_seed)
+        except Exception:
+            flat = {"params": np.full(n_params, np.nan),
+                   "cost": np.inf, "success": False}
+
+        flat["coord"] = (i, j, k)
+        results.append(flat)
+
+    return results

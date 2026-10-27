@@ -1,67 +1,16 @@
 # dce_mri
 
-Academic code repository for DCE-MRI pharmacokinetic modelling pipeline.
+DCE-MRI pharmacokinetic modelling pipeline.
 
-## Installation
-
-### 1. Clone the repository
-
-```bash
-git clone <repository-url>
-cd dce_mri
-```
-
-### 2. Create a Python environment
-
-Using Conda:
-
-```bash
-conda create -n dce_mri python=3.11
-conda activate dce_mri
-```
-
-Alternatively, create an environment directly from the provided specification file:
-
-```bash
-conda create --name dce_mri --file spec-file.txt
-conda activate dce_mri
-```
-
-### 3. Install the package
-
-Install the package in editable mode together with development dependencies:
+## Install
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 4. Verify installation
-
-Start Python and confirm imports work:
-
-```python
-import dce_mri
-
-from dce_mri.config import AcquisitionConfig
-from dce_mri.kinetic_models import TCXM
-```
-
-No errors should be produced.
-
-
-## Quick Start
-```
-Create an environment and install dependencies from spec-file.txt.
-Launch Jupyter from the repository root.
-Open a notebook under notebooks/.
-```
-
 ## Structure
 
 ```
-src/dce_mri/: core Python modules for models, optimizer
-notebooks/: exploratory and experiment notebooks
-
 src/dce_mri/
     config.py           — all frozen dataclasses (configs + result types)
     signal_models.py    — SPGR signal ↔ concentration conversion
@@ -77,9 +26,21 @@ src/dce_mri/
     io.py               — load_aif, load_nifti_canonical, load/save npz
     visualization.py    — all plot_* functions
 
+scripts/
+    run_voxelwise.py            — standard per-voxel fitting over a volume
+    run_voxelwise_admm.py       — TV-regularised joint fitting over a volume
+    run_roi_fitting.py          — whole-ROI mean curve fitting
+    run_bootstrap_sweep.py      — bootstrap uncertainty sigma sweep
+
 notebooks/
-    06_roi_fitting.ipynb
+    01_signal_to_concentration.ipynb
+    02_single_voxel_fitting.ipynb
+    03_dispersed_gkm.ipynb
+    04_ace_protocol.ipynb
+    05_bootstrap_uncertainty.ipynb
+    06_voxelwise_maps.ipynb
 ```
+
 ## Usage
 
 ```python

@@ -41,12 +41,16 @@ from dce_mri.config import (
     RoiFittingConfig,
     RoiFitResult,
     DelayedFitResult,
+    RoiDelayedFitResult,
+    AifConfig,
+    RelaxationConfig,
 )
 from dce_mri.kinetic_models import KineticModelSpec
 from dce_mri.signal_models import (
     signal_to_concentration,
     concentration_to_signal,
     compute_S0,
+    shift_aif,
 )
 from dce_mri.fitting import (
     fit_single_voxel,
@@ -57,7 +61,7 @@ from dce_mri.fitting import (
     _fit_concentration_curve_with_delay_continuous,
 )
 
-
+from dce_mri.water_exchange import WaterExchangeModelSpec
 # =============================================================================
 # Public: single ROI fitter
 # =============================================================================
@@ -74,6 +78,9 @@ def fit_roi(
     fitting_cfg: FittingConfig,
     roi_cfg:     RoiFittingConfig,
     seed:        Optional[int] = None,
+    wx_model:    Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:     Optional[AifConfig]             = None,
+    relax_cfg:   Optional[RelaxationConfig]       = None,
 ) -> RoiFitResult:
     """
     Fit kinetic model to the mean curve of a masked ROI.
@@ -81,35 +88,97 @@ def fit_roi(
     Aggregation space is controlled by roi_cfg.average_space:
         'signal'        — average raw signal first, then convert to C(t)
         'concentration' — convert each voxel to C(t), then average
-
-    Always fits in concentration space (fit_space='concentration')
-    since Ct_mean is already a concentration curve after aggregation.
+        
+    Fitting space is COUPLED to roi_cfg.average_space:
+    'signal'        — requires fitting_cfg.fit_space == 'signal'
+                      (raises ValueError otherwise). Fits directly
+                      against St_mean via fit_single_voxel.
+    'concentration' — fits against Ct_mean via _fit_concentration_curve,
+                      as before. fitting_cfg.fit_space is not checked
+                      in this branch.
+                      
+    wx_model, aif_cfg, relax_cfg : forwarded to fit_single_voxel when
+    roi_cfg.average_space == 'signal'. Requires average_space=
+    'signal' (validated below) -- concentration-space averaging
+    pools Ct across voxels before per-voxel ve/vb are available,
+    which the wx forward model needs.
     """
+    from dce_mri.fitting import _validate_wx_compatibility
+
+    _validate_wx_compatibility(wx_model, fitting_cfg.fit_space, model,
+                               time_var, aif, aif_cfg, relax_cfg,
+                               average_space=roi_cfg.average_space)
+    
+    if roi_cfg.average_space == "signal" and fitting_cfg.fit_space != "signal":
+        raise ValueError(
+            "roi_cfg.average_space='signal' requires fitting_cfg.fit_space="
+            "'signal' to fit against the aggregated signal curve directly; "
+            f"got fitting_cfg.fit_space={fitting_cfg.fit_space!r}. Either "
+            "build a FittingConfig with fit_space='signal', or use "
+            "roi_cfg.average_space='concentration'."
+        )
     Ct_mean, n_voxels, St_mean = _aggregate_roi_signal(
         sig_4d, mask, acq, subject, roi_cfg
     )
+    if roi_cfg.average_space == "signal" :
+        print("fit_roi() is performing fit to signal time curve")
+        result  = fit_single_voxel(
+            St_mean, aif, time_var, model, acq, subject, fitting_cfg, seed,
+            wx_model=wx_model, aif_cfg=aif_cfg, relax_cfg=relax_cfg,
+        )
 
-    # force concentration space — Ct_mean is already concentration
-    result = _fit_concentration_curve(
-        Ct_mean, aif, time_var, model, fitting_cfg, seed
-    )
+        St_pred = result.S_pred
+        if wx_model is None:
+            Ct_pred = model.fn(result.params, time_var, aif)
+        else:
+            # Ct_pred has no single well-defined meaning under wx --
+            # Cv/Ce are separate pools, not summed the FXL way. Report
+            # their sum for plotting continuity, but this is NOT what
+            # the wx forward model actually used to produce St_pred.
+            Cv_pred, Ce_pred = model.fn_compartments(result.params, time_var, aif)
+            Ct_pred = Cv_pred + Ce_pred
 
-    Ct_pred = model.fn(result.params, time_var, aif)
-    S0      = float(compute_S0(St_mean[None, :], acq)[0])
-    St_pred = concentration_to_signal(Ct_pred, acq, subject.T10,
-                                      subject.B1, S0)
 
-    return RoiFitResult(
-        params        = result.params,
-        cost          = result.cost,
-        success       = result.success,
-        Ct_mean       = Ct_mean,
-        Ct_pred       = Ct_pred,
-        St_mean       = St_mean,
-        St_pred       = St_pred,
-        n_voxels      = n_voxels,
-        average_space = roi_cfg.average_space,
-    )
+        return RoiFitResult(
+            params        = result.params,
+            cost          = result.cost,
+            success       = result.success,
+            Ct_mean       = Ct_mean,
+            Ct_pred       = Ct_pred,
+            St_mean       = St_mean,
+            St_pred       = St_pred,
+            n_voxels      = n_voxels,
+            average_space = roi_cfg.average_space,
+            wx_params     = getattr(result, "wx_params", None),
+            wx_model_name = getattr(result, "wx_model_name", None),
+        )
+      
+    else:
+        print("fit_roi() is performing fit to concentration time curve")
+
+        # force concentration space — Ct_mean is already concentration
+        result = _fit_concentration_curve(
+            Ct_mean, aif, time_var, model, fitting_cfg, seed
+        )
+    
+        Ct_pred = model.fn(result.params, time_var, aif)
+        S0      = float(compute_S0(St_mean[None, :], acq)[0])
+        St_pred = concentration_to_signal(Ct_pred, acq, subject.T10,
+                                          subject.B1, S0)
+
+        return RoiFitResult(
+            params        = result.params,
+            cost          = result.cost,
+            success       = result.success,
+            Ct_mean       = Ct_mean,
+            Ct_pred       = Ct_pred,
+            St_mean       = St_mean,
+            St_pred       = St_pred,
+            n_voxels      = n_voxels,
+            average_space = roi_cfg.average_space,
+            wx_params     = getattr(result, "wx_params", None),
+            wx_model_name = getattr(result, "wx_model_name", None),
+        )
 
 
 # =============================================================================
@@ -129,19 +198,95 @@ def fit_roi_with_delay_grid(
     tau_values:  np.ndarray,
     seed:        Optional[int] = None,
     interp_method: str         = "linear",
-) -> DelayedFitResult:
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:  Optional[AifConfig] = None,
+    relax_cfg:Optional[RelaxationConfig] = None,
+) -> RoiDelayedFitResult:
     """
+    Fit kinetic model to the mean curve of a masked ROI.
     ROI fitting with grid search over AIF time delays.
 
-    Aggregates ROI to mean concentration curve first, then calls
-    fit_with_delay_grid on that single curve.
+    Aggregation space is controlled by roi_cfg.average_space:
+        'signal'        — average raw signal first, then convert to C(t)
+        'concentration' — convert each voxel to C(t), then average
+        
+    Fitting space is COUPLED to roi_cfg.average_space:
+    'signal'        — requires fitting_cfg.fit_space == 'signal'
+                      (raises ValueError otherwise). Fits directly
+                      against St_mean via fit_with_delay_grid.
+    'concentration' — fits against Ct_mean via _fit_concentration_curve_with_delay_grid.
+                      fitting_cfg.fit_space is not checked in this branch.
     """
+    from dce_mri.fitting import _validate_wx_compatibility
+    
+    _validate_wx_compatibility(wx_model, fitting_cfg.fit_space, model,
+                           time_var, aif, aif_cfg, relax_cfg,
+                           average_space=roi_cfg.average_space)
+    
+    if roi_cfg.average_space == "signal" and fitting_cfg.fit_space != "signal":
+        raise ValueError(
+            "roi_cfg.average_space='signal' requires fitting_cfg.fit_space="
+            "'signal' to fit against the aggregated signal curve directly; "
+            f"got fitting_cfg.fit_space={fitting_cfg.fit_space!r}. Either "
+            "build a FittingConfig with fit_space='signal', or use "
+            "roi_cfg.average_space='concentration'."
+        )
+    
     Ct_mean, n_voxels, St_mean = _aggregate_roi_signal(
         sig_4d, mask, acq, subject, roi_cfg
     )
-    return _fit_concentration_curve_with_delay_grid(
-        Ct_mean, aif, time_var, model, acq, fitting_cfg, tau_values, seed, interp_method=interp_method
+    if roi_cfg.average_space == "signal":
+        print("fit_roi_with_delay_grid() is performing fit to signal time curve")
+        delayed= fit_with_delay_grid(
+            St_mean, aif, time_var, model, acq, subject, fitting_cfg,
+            tau_values, seed, interp_method=interp_method,
+            wx_model=wx_model, aif_cfg=aif_cfg, relax_cfg=relax_cfg,
+        )
+    else:
+        print("fit_roi_with_delau_grid() is performing fit to concentration time curve")
+        delayed= _fit_concentration_curve_with_delay_grid(
+            Ct_mean, aif, time_var, model, acq, fitting_cfg, tau_values, seed, interp_method=interp_method
+        )
+    
+
+    shifted_aif = shift_aif(aif, delayed.best_tau, time_var, acq, method=interp_method)
+    S0          = float(compute_S0(St_mean[None, :], acq)[0])
+   
+    
+    if wx_model is None:
+        Ct_pred = model.fn(delayed.best_params, time_var, shifted_aif)
+        St_pred = concentration_to_signal(Ct_pred, acq, subject.T10, subject.B1, S0)
+    else:
+        Cv_pred, Ce_pred = model.fn_compartments(delayed.best_params, time_var, shifted_aif)
+        Ct_pred = Cv_pred + Ce_pred
+        ve = delayed.best_params[model.param_names.index("ve")]
+        vb = delayed.best_params[model.param_names.index("vp")]
+        if wx_model.n_params == 0:
+            theta_wx = ()                    # NXL: wx_params is empty
+        else:
+            tau_b = relax_cfg.tau_b_fixed if not relax_cfg.fit_tau_b else delayed.wx_params[0]
+            tau_i = delayed.wx_params[-1]
+            theta_wx = (tau_b, tau_i)
+        St_pred = wx_model.to_signal(Cv_pred, Ce_pred, ve, vb, theta_wx,
+                                     acq, subject, aif_cfg, relax_cfg, S0)
+
+    return RoiDelayedFitResult(
+        best_tau      = delayed.best_tau,
+        best_params   = delayed.best_params,
+        best_cost     = delayed.best_cost,
+        per_tau       = delayed.per_tau,
+        success       = delayed.success,
+        fit_mode      = delayed.fit_mode,
+        Ct_mean       = Ct_mean,
+        Ct_pred       = Ct_pred,
+        St_mean       = St_mean,
+        St_pred       = St_pred,
+        n_voxels      = n_voxels,
+        average_space = roi_cfg.average_space,
+        wx_params     = delayed.wx_params,
+        wx_model_name = delayed.wx_model_name,
     )
+
 
 # =============================================================================
 # Public: ROI fitting with continuous delay
@@ -162,20 +307,95 @@ def fit_roi_with_delay_continuous(
     tau_p0:      float         =   0.0,
     seed:        Optional[int] = None,
     interp_method: str         = "linear",
-) -> DelayedFitResult:
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:  Optional[AifConfig] = None,
+    relax_cfg:Optional[RelaxationConfig] = None,
+) -> RoiDelayedFitResult:
     """
-    ROI fitting with tau as a continuous free parameter.
+    Fit kinetic model to the mean curve of a masked ROI.
+    ROI fitting continuously over AIF time delays.
 
-    Aggregates ROI to mean concentration curve first, then calls
-    fit_with_delay_continuous on that single curve.
+    Aggregation space is controlled by roi_cfg.average_space:
+        'signal'        — average raw signal first, then convert to C(t)
+        'concentration' — convert each voxel to C(t), then average
+        
+    Fitting space is COUPLED to roi_cfg.average_space:
+    'signal'        — requires fitting_cfg.fit_space == 'signal'
+                      (raises ValueError otherwise). Fits directly
+                      against St_mean via fit_with_delay_continuous.
+    'concentration' — fits against Ct_mean via _fit_concentration_curve_with_delay_continuous.
+                      fitting_cfg.fit_space is not checked in this branch.
     """
+    from dce_mri.fitting import _validate_wx_compatibility
+
+    _validate_wx_compatibility(wx_model, fitting_cfg.fit_space, model,
+                               time_var, aif, aif_cfg, relax_cfg,
+                               average_space=roi_cfg.average_space)
+    
+    if roi_cfg.average_space == "signal" and fitting_cfg.fit_space != "signal":
+        raise ValueError(
+            "roi_cfg.average_space='signal' requires fitting_cfg.fit_space="
+            "'signal' to fit against the aggregated signal curve directly; "
+            f"got fitting_cfg.fit_space={fitting_cfg.fit_space!r}. Either "
+            "build a FittingConfig with fit_space='signal', or use "
+            "roi_cfg.average_space='concentration'."
+        )
+    
     Ct_mean, n_voxels, St_mean = _aggregate_roi_signal(
         sig_4d, mask, acq, subject, roi_cfg
     )
-    return _fit_concentration_curve_with_delay_continuous(
-        Ct_mean, aif, time_var, model, acq, fitting_cfg,
-        tau_lb, tau_ub, tau_p0, seed, interp_method=interp_method
+    if roi_cfg.average_space == "signal":
+        print("fit_roi_with_delay_continuous() is performing fit to signal time curve")
+        delayed= fit_with_delay_continuous(
+            St_mean, aif, time_var, model, acq, subject, fitting_cfg,
+            tau_lb, tau_ub, tau_p0, seed, interp_method=interp_method,
+            wx_model=wx_model, aif_cfg=aif_cfg, relax_cfg=relax_cfg,
+        )
+    else:
+        print("fit_roi_with_delay_continuous() is performing fit to concentration time curve")
+        delayed= _fit_concentration_curve_with_delay_continuous(
+            Ct_mean, aif, time_var, model, acq, fitting_cfg,
+            tau_lb, tau_ub, tau_p0, seed, interp_method=interp_method,           
+        )
+    
+
+    shifted_aif = shift_aif(aif, delayed.best_tau, time_var, acq, method=interp_method)
+    S0          = float(compute_S0(St_mean[None, :], acq)[0])
+    
+    if wx_model is None:
+        Ct_pred = model.fn(delayed.best_params, time_var, shifted_aif)
+        St_pred = concentration_to_signal(Ct_pred, acq, subject.T10, subject.B1, S0)
+    else:
+        Cv_pred, Ce_pred = model.fn_compartments(delayed.best_params, time_var, shifted_aif)
+        Ct_pred = Cv_pred + Ce_pred
+        ve = delayed.best_params[model.param_names.index("ve")]
+        vb = delayed.best_params[model.param_names.index("vp")]
+        if wx_model.n_params == 0:
+            theta_wx = ()                    # NXL: wx_params is empty
+        else:
+            tau_b = relax_cfg.tau_b_fixed if not relax_cfg.fit_tau_b else delayed.wx_params[0]
+            tau_i = delayed.wx_params[-1]
+            theta_wx = (tau_b, tau_i)
+        St_pred = wx_model.to_signal(Cv_pred, Ce_pred, ve, vb, theta_wx,
+                                     acq, subject, aif_cfg, relax_cfg, S0)
+
+    return RoiDelayedFitResult(
+        best_tau      = delayed.best_tau,
+        best_params   = delayed.best_params,
+        best_cost     = delayed.best_cost,
+        per_tau       = delayed.per_tau,
+        success       = delayed.success,
+        fit_mode      = delayed.fit_mode,
+        Ct_mean       = Ct_mean,
+        Ct_pred       = Ct_pred,
+        St_mean       = St_mean,
+        St_pred       = St_pred,
+        n_voxels      = n_voxels,
+        average_space = roi_cfg.average_space,
+        wx_params     = delayed.wx_params,
+        wx_model_name = delayed.wx_model_name,
     )
+
 # =============================================================================
 # Public: multi-ROI fitter
 # =============================================================================

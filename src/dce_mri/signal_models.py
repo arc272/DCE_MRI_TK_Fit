@@ -42,7 +42,8 @@ def signal_to_concentration(
                       _EPS, 1.0 - yprime * cos_a)
 
     E1   = numer / denom
-    T1_t = -TR_s / (np.log(E1) + _EPS)
+    E1   = np.clip(E1, _EPS, 1.0 - _EPS) 
+    T1_t = -TR_s / np.log(E1) 
     dR1  = 1.0 / (T1_t + _EPS) - 1.0 / T10_s
     C_t  = dR1 / (acq.r1 + _EPS)
 
@@ -96,6 +97,103 @@ def compute_S0(
     acq: AcquisitionConfig,
 ) -> np.ndarray:
     return sig[:, acq.nbase].mean(axis=1)
+
+ 
+ 
+# =============================================================================
+# Multi-flip-angle / ACE signal model
+# =============================================================================
+ 
+def spgr_signal_abs(
+    R1_t:        np.ndarray,
+    alpha_t_deg: np.ndarray,
+    TR_t_ms:     np.ndarray,
+    B1:          float,
+    M0:          float,
+) -> np.ndarray:
+    """
+    Absolute (un-normalised) SPGR signal for a time-varying flip-angle /
+    TR schedule.
+ 
+        theta_t = deg2rad(B1 * alpha_t_deg)
+        E1_t    = exp(-R1_t * TR_t_s)
+        S(t)    = M0 * sin(theta_t) * (1 - E1_t) / (1 - E1_t*cos(theta_t))
+ 
+    Unlike concentration_to_signal, this does NOT divide by a baseline
+    frame: with a time-varying flip angle, dividing every frame by one
+    fixed-angle baseline frame no longer cancels M0 cleanly (see the
+    small-angle B1/T10 degeneracy), so M0 stays explicit here.
+ 
+    1-D only: one (R1_t, alpha_t_deg, TR_t_ms) triple per call. All three
+    inputs must be the same shape, or broadcastable to it.
+ 
+    Parameters
+    ----------
+    R1_t        : (T,) longitudinal relaxation rate  (1/s)
+    alpha_t_deg : (T,) nominal flip angle per frame  (degrees)
+    TR_t_ms     : (T,) repetition time per frame  (ms)
+    B1          : RF transmit field scaling (dimensionless)
+    M0          : equilibrium longitudinal magnetization (a.u.)
+ 
+    Returns
+    -------
+    S_t : (T,) absolute signal, same units as M0
+    """
+    R1_t        = np.asarray(R1_t,        dtype=np.float64)
+    alpha_t_deg = np.asarray(alpha_t_deg, dtype=np.float64)
+    TR_t_ms     = np.asarray(TR_t_ms,     dtype=np.float64)
+ 
+    TR_t_s = TR_t_ms / 1_000.0
+    theta  = np.deg2rad(B1 * alpha_t_deg)
+    cos_a  = np.cos(theta)
+    sin_a  = np.sin(theta)
+ 
+    E1    = np.exp(-R1_t * TR_t_s)
+    denom = np.maximum(1.0 - E1 * cos_a, _EPS)
+ 
+    return M0 * sin_a * (1.0 - E1) / denom
+ 
+ 
+def concentration_to_signal_mfa(
+    C_t:         np.ndarray,
+    alpha_t_deg: np.ndarray,
+    TR_t_ms:     np.ndarray,
+    T10_ms:      float,
+    B1:          float,
+    M0:          float,
+    r1:          float,
+) -> np.ndarray:
+    """
+    Absolute SPGR signal for a multi-flip-angle / ACE acquisition.
+ 
+        R1(t) = 1000/T10_ms + r1*C_t
+        S(t)  = spgr_signal_abs(R1(t), alpha_t_deg, TR_t_ms, B1, M0)
+ 
+    A conventional single-flip-angle acquisition is just the case where
+    alpha_t_deg and TR_t_ms are constant arrays -- see the
+    back-compatibility test against concentration_to_signal in
+    tests/mfa_verification_tests/test_signal_models_mfa.py.
+ 
+    1-D only, matching spgr_signal_abs.
+ 
+    Parameters
+    ----------
+    C_t         : (T,) CA concentration  (mM)
+    alpha_t_deg : (T,) nominal flip angle per frame  (degrees)
+    TR_t_ms     : (T,) repetition time per frame  (ms)
+    T10_ms      : pre-contrast T1  (ms)
+    B1          : RF transmit field scaling (dimensionless)
+    M0          : equilibrium longitudinal magnetization (a.u.)
+    r1          : CA relaxivity  (mM^-1 s^-1)
+ 
+    Returns
+    -------
+    S_t : (T,) absolute signal, same units as M0
+    """
+    C_t  = np.asarray(C_t, dtype=np.float64)
+    R1_t = 1_000.0 / T10_ms + r1 * C_t
+    return spgr_signal_abs(R1_t, alpha_t_deg, TR_t_ms, B1, M0)
+ 
 
 # --- Aif Extraction from ROI -----------------------------------------------
 

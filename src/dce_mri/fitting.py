@@ -41,14 +41,335 @@ from dce_mri.config import (
     AcquisitionConfig,
     SubjectConfig,
     FittingConfig,
+    FitModeConfig,
     VoxelFitResult,
     DispersedGKMResult,
     DelayedFitResult,
+    AifConfig,
+    RelaxationConfig,
 )
+
 from dce_mri.kinetic_models import KineticModelSpec, DISPERSED_GKM
 from dce_mri.signal_models import signal_to_concentration, concentration_to_signal, shift_aif
+from dce_mri.water_exchange import WaterExchangeModelSpec
 
+# =============================================================================
+# Public: validate fit model choice
+# =============================================================================
+def _validate_wx_compatibility(
+    wx_model,
+    fit_space:  str,
+    model:      KineticModelSpec,
+    time_var:   np.ndarray,
+    aif:        np.ndarray,
+    aif_cfg,
+    relax_cfg,
+    average_space:  Optional[str] = None,
+) -> None:
+    """
+    Guardrail for water-exchange fitting. Raises ValueError on any
+    incompatibility; returns None (no-op) if wx_model is None.
 
+    Checks, in order:
+      0. wx_model is None -> return immediately, nothing else runs
+      1. aif_cfg was supplied (every 3-pool model needs blood T10 for
+         the plasma pool), and relax_cfg was supplied when the model
+         has free exchange parameters (SSM3 needs the tau bounds /
+         fit_tau_b flag; NXL has n_params=0 and needs no relax_cfg)
+      2. fit_space == 'signal' (wx models produce signal directly;
+         they have no defined behavior in concentration space)
+      3. model.fn_compartments is not None (wx needs Cv/Ce separately,
+         not just their sum Ct)
+      4. wx_model.n_pools matches what model.fn_compartments actually
+         implies (n_curves + 1, for the intracellular pool). This is
+         the check that rejects FXL: FXL.n_pools=1, but any model with
+         fn_compartments implies 3. Use fit_single_voxel without
+         wx_model for fast-exchange fitting instead.
+      5. average_space == 'signal' when supplied (ROI callers only --
+         wx models need per-voxel ve/vb before averaging makes sense;
+         'concentration' mode averages Ct across voxels first, which
+         throws away exactly that per-voxel split. Not checked when
+         average_space is None, i.e. for fit_single_voxel.)
+    """
+    if wx_model is None:
+        return
+
+    if aif_cfg is None or (wx_model.n_params > 0 and relax_cfg is None):
+        raise ValueError(
+            f"wx_model={wx_model.name!r} requires aif_cfg"
+            + (" and relax_cfg" if wx_model.n_params > 0 else "")
+            + " to be supplied (aif_cfg carries blood T10 for the vascular "
+            "pool baseline; relax_cfg carries tau bounds and the fit_tau_b "
+            "flag)."
+        )
+
+    if fit_space != "signal":
+        raise ValueError(
+            f"wx_model={wx_model.name!r} requires cfg.fit_space='signal', "
+            f"got {fit_space!r}. Water-exchange models produce signal "
+            f"directly and have no defined concentration-space form."
+        )
+
+    if model.fn_compartments is None:
+        raise ValueError(
+            f"wx_model={wx_model.name!r} requires model.fn_compartments "
+            f"to be set on {model.name!r} (need Cv/Ce separately, not "
+            f"just their sum Ct)."
+        )
+
+    Cv, Ce = model.fn_compartments(model.p0, time_var, aif)
+    n_conc_curves  = 2   # Cv, Ce -- fn_compartments always returns a pair
+    n_pools_implied = n_conc_curves + 1   # + intracellular pool
+
+    if wx_model.n_pools != n_pools_implied:
+        raise ValueError(
+            f"{wx_model.name} has n_pools={wx_model.n_pools}, but "
+            f"{model.name} implies {n_pools_implied} pools "
+            f"({n_conc_curves} concentration curves + intracellular). "
+            f"For fast-exchange fitting, call this function without "
+            f"wx_model rather than passing FXL."
+        )
+    if average_space is not None and average_space != "signal":
+        raise ValueError(
+            f"wx_model={wx_model.name!r} requires roi_cfg.average_space="
+            f"'signal', got {average_space!r}. Averaging in concentration "
+            f"space pools Ct across voxels before ve/vb are known "
+            f"per-voxel, which wx_model.to_signal needs. Use "
+            f"average_space='signal', or omit wx_model for concentration-"
+            f"space ROI fitting."
+        )
+
+# =============================================================================
+# Public: shared residual builder (used by NLLS, bootstrap AND Bayesian)
+# =============================================================================
+from dataclasses import dataclass as _dataclass
+ 
+ 
+@_dataclass(frozen=True)
+class ResidualBundle:
+    """
+    Everything a fitter needs to evaluate one parameter vector.
+ 
+    Extracted from fit_single_voxel so that the NLLS optimiser, the
+    bootstrap replicate fitter and the Bayesian log-likelihood all
+    evaluate *the same* residual. Any drift between them would silently
+    invalidate posterior-vs-bootstrap comparisons.
+ 
+    Fields
+    ------
+    residual_fn : callable  p_aug -> residual vector (pred - target)
+    predict_fn  : callable  p_aug -> predicted curve (no subtraction)
+    lb, ub      : bounds for the FULL augmented vector (kinetic + wx)
+    log_dims    : indices to sample log-uniformly, for the full vector
+    n_kin       : length of the kinetic block (INCLUDES tau_delay when
+                  an augmented delay spec was passed in)
+    target      : the measured curve being fitted against
+    param_names : names for the full augmented vector
+    """
+    residual_fn: object
+    predict_fn:  object
+    lb:          np.ndarray
+    ub:          np.ndarray
+    log_dims:    Optional[tuple]
+    n_kin:       int
+    target:      np.ndarray
+    param_names: tuple
+ 
+ 
+def build_residual(
+    sig:      np.ndarray,
+    aif:      np.ndarray,
+    time_var: np.ndarray,
+    model:    KineticModelSpec,
+    acq:      AcquisitionConfig,
+    subject:  SubjectConfig,
+    cfg:      FittingConfig,
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:  Optional[AifConfig] = None,
+    relax_cfg:Optional[RelaxationConfig] = None,
+    *,
+    keep_mask:  Optional[np.ndarray] = None,
+    on_failure: str = "penalty",
+) -> ResidualBundle:
+    """
+    Build the residual function for one voxel.
+ 
+    on_failure : 'penalty' -> return 1e6 everywhere (correct for
+                 least-squares; a huge residual steers the optimiser away)
+                 'nan'     -> return NaN everywhere, so a Bayesian caller
+                 can convert to -inf. Feeding 1e6 into a Gaussian
+                 log-density gives a finite but astronomically negative
+                 number, which behaves differently near bounds than a
+                 hard rejection -- hence the switch.
+ 
+    keep_mask  : optional boolean mask over timepoints (bootstrap
+                 frame-drop uses this). None -> all frames kept.
+    """
+    if on_failure not in ("penalty", "nan"):
+        raise ValueError(f"on_failure must be 'penalty' or 'nan', got {on_failure!r}")
+ 
+    _validate_wx_compatibility(wx_model, cfg.fit_space, model, time_var,
+                               aif, aif_cfg, relax_cfg)
+ 
+    from dce_mri.signal_models import compute_S0
+ 
+    n_kin = len(model.p0)
+    fail_val = 1e6 if on_failure == "penalty" else np.nan
+ 
+    if wx_model is None:
+        # ── fast-exchange path ──────────────────────────────────────
+        if cfg.fit_space == "concentration":
+            target = signal_to_concentration(sig, acq, subject.T10, subject.B1)
+ 
+            def predict_fn(p):
+                return model.fn(p, time_var, aif)
+ 
+        elif cfg.fit_space == "signal":
+            S0 = float(compute_S0(sig[None, :], acq)[0])
+            target = sig
+ 
+            def predict_fn(p):
+                Ct = model.fn(p, time_var, aif)
+                return concentration_to_signal(Ct, acq, subject.T10,
+                                               subject.B1, S0)
+        else:
+            raise ValueError(
+                "cfg.fit_space must be 'signal' or 'concentration', "
+                f"got {cfg.fit_space!r}."
+            )
+ 
+        lb_use, ub_use = model.lb, model.ub
+        log_dims_use   = model.log_dims
+        names_use      = model.param_names
+ 
+    else:
+        # ── wx-aware path ───────────────────────────────────────────
+        S0     = float(compute_S0(sig[None, :], acq)[0])
+        target = sig
+        ve_idx = model.param_names.index("ve")
+        vp_idx = model.param_names.index("vp")
+
+        if wx_model.n_params == 0:
+            # NXL: no free exchange parameters -- p_aug IS theta_kin, so
+            # bounds / log_dims / names are the kinetic model's own.
+            lb_use, ub_use = model.lb, model.ub
+            log_dims_use   = model.log_dims
+            names_use      = model.param_names
+        elif relax_cfg.fit_tau_b:
+            lb_use = np.concatenate([model.lb, [relax_cfg.tau_b_lb, relax_cfg.tau_i_lb]])
+            ub_use = np.concatenate([model.ub, [relax_cfg.tau_b_ub, relax_cfg.tau_i_ub]])
+            log_dims_use = tuple(model.log_dims or ()) + (n_kin + 1,)
+            names_use    = (*model.param_names, "tau_b", "tau_i")
+        else:
+            lb_use = np.concatenate([model.lb, [relax_cfg.tau_i_lb]])
+            ub_use = np.concatenate([model.ub, [relax_cfg.tau_i_ub]])
+            log_dims_use = tuple(model.log_dims or ()) + (n_kin,)
+            names_use    = (*model.param_names, "tau_i")
+ 
+        def predict_fn(p_aug):
+            theta_kin = p_aug[:n_kin]
+            if wx_model.n_params == 0:
+                theta_wx = ()
+            elif relax_cfg.fit_tau_b:
+                theta_wx = (p_aug[n_kin], p_aug[n_kin + 1])
+            else:
+                theta_wx = (relax_cfg.tau_b_fixed, p_aug[n_kin])
+            Cv, Ce = model.fn_compartments(theta_kin, time_var, aif)
+            return wx_model.to_signal(
+                Cv, Ce, theta_kin[ve_idx], theta_kin[vp_idx],
+                theta_wx, acq, subject, aif_cfg, relax_cfg, S0)
+ 
+    # ── wrap prediction into a guarded residual ─────────────────────
+    tgt = target if keep_mask is None else target[keep_mask]
+ 
+    def residual_fn(p_aug):
+        p_aug = np.asarray(p_aug, dtype=float)
+        if model.constraints is not None and not model.constraints(p_aug[:n_kin]):
+            return np.full_like(tgt, fail_val)
+        try:
+            pred = predict_fn(p_aug)
+        except Exception:
+            return np.full_like(tgt, fail_val)
+        if pred is None or not np.all(np.isfinite(pred)):
+            return np.full_like(tgt, fail_val)
+        if keep_mask is not None:
+            pred = pred[keep_mask]
+        return pred - tgt
+ 
+    return ResidualBundle(
+        residual_fn = residual_fn,
+        predict_fn  = predict_fn,
+        lb          = np.asarray(lb_use, dtype=float),
+        ub          = np.asarray(ub_use, dtype=float),
+        log_dims    = log_dims_use,
+        n_kin       = n_kin,
+        target      = target,
+        param_names = names_use,
+    )
+ 
+def build_delay_augmented_spec(
+    model:    KineticModelSpec,
+    aif:      np.ndarray,
+    time_var: np.ndarray,
+    acq:      AcquisitionConfig,
+    tau_lb:   float = -10.0,
+    tau_ub:   float =  30.0,
+    tau_p0:   float =   0.0,
+    interp_method: str = "linear",
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+) -> KineticModelSpec:
+    """
+    Build the tau-augmented KineticModelSpec used by joint (continuous)
+    delay fitting.
+ 
+    theta_aug = [*theta_kin, tau_delay]  -- tau is ALWAYS last in the
+    kinetic block, and any wx parameters are appended after it by
+    build_residual / fit_single_voxel.
+ 
+    Extracted from fit_with_delay_continuous so the Bayesian sampler can
+    reuse the identical augmentation instead of duplicating it.
+    """
+    lb_aug = np.append(model.lb, tau_lb)
+    ub_aug = np.append(model.ub, tau_ub)
+    p0_aug = np.append(model.p0, tau_p0)
+ 
+    # tau spans zero so it is never log-sampled -- keep model's log_dims
+    log_dims_aug = list(model.log_dims) if model.log_dims else []
+ 
+    def constraints_aug(p_aug):
+        if model.constraints is not None:
+            return model.constraints(p_aug[:-1])
+        return True
+ 
+    def _wrap(base_fn):
+        def wrapped(theta_aug, t, _aif_ignored):
+            tau_val     = float(theta_aug[-1])
+            theta_kin   = theta_aug[:-1]
+            shifted_aif = shift_aif(aif, tau_val, time_var, acq,
+                                    method=interp_method)
+            return base_fn(theta_kin, t, shifted_aif)
+        return wrapped
+ 
+    delayed_compartments_fn = None
+    if wx_model is not None:
+        if model.fn_compartments is None:
+            raise ValueError(
+                f"wx_model={wx_model.name!r} requires model.fn_compartments, "
+                f"but {model.name!r} has none set."
+            )
+        delayed_compartments_fn = _wrap(model.fn_compartments)
+ 
+    return KineticModelSpec(
+        name        = model.name + "_delay",
+        fn          = _wrap(model.fn),
+        fn_compartments = delayed_compartments_fn,
+        param_names = (*model.param_names, "tau_delay"),
+        lb          = lb_aug,
+        ub          = ub_aug,
+        p0          = p0_aug,
+        constraints = constraints_aug,
+        log_dims    = tuple(log_dims_aug) if log_dims_aug else None,
+    )
 # =============================================================================
 # Public: standard single-voxel fitter
 # =============================================================================
@@ -63,6 +384,9 @@ def fit_single_voxel(
     subject:  SubjectConfig,
     cfg:      FittingConfig,
     seed:     Optional[int] = None,
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:  Optional[AifConfig] = None,
+    relax_cfg:Optional[RelaxationConfig] = None,
 ) -> VoxelFitResult:
     """
     Fit any KineticModelSpec to one voxel using LHS + TRF.
@@ -88,26 +412,24 @@ def fit_single_voxel(
     VoxelFitResult
 
     """
+   
     from dce_mri.signal_models import compute_S0
-
-    # ── Build residual function ───────────────────────────────────────
-    if cfg.fit_space == "concentration":
-        Ct_meas = signal_to_concentration(sig, acq, subject.T10, subject.B1)
-        target  = Ct_meas
-        def residual_fn(p):
-            return _residual_concentration(p, target, time_var, aif,
-                                           model.fn, model.constraints)
-    else:
-        S0 = float(compute_S0(sig[None, :], acq)[0])
-        target = sig
-        def residual_fn(p):
-            return _residual_signal(p, target, time_var, aif,
-                                    model.fn, acq, subject.T10,
-                                    subject.B1, S0, model.constraints)
+ 
+    # ── Build residual function (shared with bootstrap + Bayesian) ────
+    bundle = build_residual(
+        sig, aif, time_var, model, acq, subject, cfg,
+        wx_model=wx_model, aif_cfg=aif_cfg, relax_cfg=relax_cfg,
+        on_failure="penalty",
+    )
+    residual_fn  = bundle.residual_fn
+    lb_use       = bundle.lb
+    ub_use       = bundle.ub
+    log_dims_use = bundle.log_dims
+    n_kin        = bundle.n_kin
 
     # ── Stage 1: LHS coarse search ────────────────────────────────────
-    samples = _lhs_starts(cfg.n_lhs, model.lb, model.ub,
-                          model.constraints, model.log_dims, seed)
+    samples = _lhs_starts(cfg.n_lhs, lb_use, ub_use,
+                          model.constraints, log_dims_use, seed)
     costs   = np.array([np.sum(residual_fn(p) ** 2) for p in samples])
 
     # ── Stage 2: TRF refinement on top candidates ─────────────────────
@@ -119,12 +441,14 @@ def fit_single_voxel(
             success = False,
             S_meas  = sig,
             S_pred  = np.zeros_like(sig),
+            wx_params     = None if wx_model is None else np.full(ub_use.shape[0] - n_kin, np.nan),
+            wx_model_name = None if wx_model is None else wx_model.name,
         )
 
     best_params, best_cost, best_status = None, np.inf, -1
     for idx in top_idx:
         params, cost, status = _trf_refine(
-            samples[idx], residual_fn, model.lb, model.ub, cfg
+            samples[idx], residual_fn, lb_use, ub_use, cfg
         )
         if params is not None and cost < best_cost:
             best_params = params
@@ -134,90 +458,96 @@ def fit_single_voxel(
     if best_params is None:
         best_params = samples[top_idx[0]]
         best_status = -1
-
+        
     # ── Reconstruct predicted signal ─────────────────────────────────
-    Ct_pred = model.fn(best_params, time_var, aif)
-    S0_out  = float(compute_S0(sig[None, :], acq)[0])
-    S_pred  = concentration_to_signal(Ct_pred, acq, subject.T10,
-                                      subject.B1, S0_out)
+    theta_kin_best = best_params[:n_kin]
+    S0_out = float(compute_S0(sig[None, :], acq)[0])
+
+    if wx_model is None:
+        Ct_pred = model.fn(theta_kin_best, time_var, aif)
+        S_pred  = concentration_to_signal(Ct_pred, acq, subject.T10,
+                                          subject.B1, S0_out)
+        wx_params_out     = None
+        wx_model_name_out = None
+    else:
+        if wx_model.n_params == 0:
+            theta_wx_best = ()                      # NXL: nothing to unpack
+        elif relax_cfg.fit_tau_b:
+            theta_wx_best = (best_params[n_kin], best_params[n_kin + 1])
+        else:
+            theta_wx_best = (relax_cfg.tau_b_fixed, best_params[n_kin])
+
+        #
+        ve_idx = bundle.param_names.index("ve")
+        vp_idx = bundle.param_names.index("vp")
+
+        Cv_best, Ce_best = model.fn_compartments(theta_kin_best, time_var, aif)
+        ve_best = theta_kin_best[ve_idx]
+        vb_best = theta_kin_best[vp_idx]
+        S_pred = wx_model.to_signal(
+            Cv_best, Ce_best, ve_best, vb_best, theta_wx_best,
+            acq, subject, aif_cfg, relax_cfg, S0_out)
+        # empty array for NXL -- NOT None, which downstream code reads as
+        # "no wx model was used" (VoxelFitResult.wx_model_name still says NXL)
+        wx_params_out     = best_params[n_kin:]
+        wx_model_name_out = wx_model.name
 
     return VoxelFitResult(
-        params  = best_params,
-        cost    = best_cost,
-        success = best_status > 0,
-        S_meas  = sig,
-        S_pred  = S_pred,
+        params        = theta_kin_best,
+        cost          = best_cost,
+        success       = best_status > 0,
+        S_meas        = sig,
+        S_pred        = S_pred,
+        wx_params     = wx_params_out,
+        wx_model_name = wx_model_name_out,
     )
 
 # =============================================================================
 # Public: dispersed GKM fitter (loops over integer branch levels)
 # =============================================================================
 def fit_dispersed_gkm(
-    sig:      np.ndarray,
-    aif:      np.ndarray,
-    time_var: np.ndarray,
-    acq:      AcquisitionConfig,
-    subject:  SubjectConfig,
-    cfg:      FittingConfig,
-    n_levels: int           = 6,
-    seed:     Optional[int] = None,
+    sig, aif, time_var, acq, subject, cfg,
+    n_levels=6, seed=None,
 ) -> DispersedGKMResult:
-    """
-    Fit dispersed-AIF GKM at each integer branch level independently.
+    from dce_mri.kinetic_models import DISPERSED_GKM_LEVELS
+    from dce_mri.vascular_aif import compute_aic, akaike_weights
 
-    For each n_level in 1…n_levels:
-        - Fix n_level
-        - Fit theta_kin = [Ktrans, ve, vp, t0] using LHS + TRF
-        - dispersed_gkm_ct(theta_kin, time_var, aif, n_level) is the forward model
-    Then select the level with lowest cost.
+    per_level = {
+        n: fit_single_voxel(sig, aif, time_var, DISPERSED_GKM_LEVELS[n],
+                            acq, subject, cfg, seed)
+        for n in range(1, n_levels + 1)
+    }
 
-    Parameters
-    ----------
-    sig      : (T,) measured MRI signal
-    aif      : (T,) global AIF
-    time_var : (T,) time grid  (s)
-    acq      : AcquisitionConfig
-    subject  : SubjectConfig
-    cfg      : FittingConfig
-    n_levels : number of integer branch levels to try (default 6)
+    n_obs = len(time_var)
+    aic_arr = np.array([
+        compute_aic(per_level[n].cost, n_obs, n_param=4)
+        for n in range(1, n_levels + 1)
+    ])
+    weights = akaike_weights(aic_arr)
 
-    Returns
-    -------
-    DispersedGKMResult
-    """
-    from dce_mri.kinetic_models import dispersed_gkm_ct
-
-    per_level = {}
-    for n in range(1, n_levels + 1):
-        def model_fn_n(theta, t, a, _n=n):
-            return dispersed_gkm_ct(theta, t, a, n_level=_n)
-
-        # temporary spec for this level — same as DISPERSED_GKM but with fn set
-        level_spec = KineticModelSpec(
-            name        = f"DispersedGKM_L{n}",
-            fn          = model_fn_n,
-            param_names = DISPERSED_GKM.param_names,
-            lb          = DISPERSED_GKM.lb,
-            ub          = DISPERSED_GKM.ub,
-            p0          = DISPERSED_GKM.p0,
-            constraints = DISPERSED_GKM.constraints,
-            log_dims    = DISPERSED_GKM.log_dims,
-        )
-        per_level[n] = fit_single_voxel(
-            sig, aif, time_var, level_spec, acq, subject, cfg, seed
+    if not np.any(weights > 0):
+        fallback_level = 1
+        return DispersedGKMResult(
+            best_level=fallback_level,
+            best_params=per_level[fallback_level].params,
+            best_cost=per_level[fallback_level].cost,
+            per_level=per_level, weights=weights, aic=aic_arr,
+            success=False,
         )
 
-    best_level = min(per_level, key=lambda n: per_level[n].cost)
+    best_level = int(np.argmax(weights)) + 1
+    params_stack = np.stack([per_level[n].params for n in range(1, n_levels + 1)])
+    cost_stack   = np.array([per_level[n].cost for n in range(1, n_levels + 1)])
+    cost_stack_safe = np.where(np.isfinite(cost_stack), cost_stack, 0.0)
+
+    best_params = np.tensordot(weights, params_stack, axes=(0, 0))
+    best_cost   = float(np.sum(weights * cost_stack_safe))
 
     return DispersedGKMResult(
-        best_level  = best_level,
-        best_params = per_level[best_level].params,
-        best_cost   = per_level[best_level].cost,
-        per_level   = per_level,
-        success     = per_level[best_level].success,
+        best_level=best_level, best_params=best_params, best_cost=best_cost,
+        per_level=per_level, weights=weights, aic=aic_arr,
+        success=any(per_level[n].success for n in range(1, n_levels + 1)),
     )
-
-
 
 # =============================================================================
 # Internal helpers
@@ -230,38 +560,37 @@ def _lhs_starts(
     constraints: Optional[callable] = None,
     log_dims:    Optional[list]     = None,
     seed:        Optional[int]      = None,
+    max_redraws: int                = 30,
 ) -> np.ndarray:
-    """
-    Draw n Latin-Hypercube samples scaled to [lb, ub].
-
-    Parameters
-    ----------
-    log_dims : list of parameter indices to sample log-uniformly
-               e.g. [2, 3] for fp and ps in TCXM
-               e.g. [0] for Ktrans in GKM
-               None = all dimensions sampled uniformly
-    """
     d       = len(lb)
+    rng     = np.random.default_rng(seed)
     sampler = qmc.LatinHypercube(d=d, seed=seed)
-    unit    = sampler.random(n=n)       # (n, d) in [0, 1]
+    unit    = sampler.random(n=n)
 
-    samples = np.empty_like(unit)
-    for dim in range(d):
-        if log_dims is not None and dim in log_dims:
-            log_lb = np.log10(lb[dim])
-            log_ub = np.log10(ub[dim])
-            samples[:, dim] = 10.0 ** (log_lb + unit[:, dim] * (log_ub - log_lb))
-        else:
-            samples[:, dim] = lb[dim] + unit[:, dim] * (ub[dim] - lb[dim])
+    def scale(u_row):
+        """Same scaling LHS itself uses -- one fresh point, correct
+        marginal distribution per dimension, independent across dims."""
+        out = np.empty(d)
+        for dim in range(d):
+            if log_dims is not None and dim in log_dims:
+                log_lb, log_ub = np.log10(lb[dim]), np.log10(ub[dim])
+                out[dim] = 10.0 ** (log_lb + u_row[dim] * (log_ub - log_lb))
+            else:
+                out[dim] = lb[dim] + u_row[dim] * (ub[dim] - lb[dim])
+        return out
 
-    # enforce constraints
+    samples = np.array([scale(unit[i]) for i in range(n)])
+
     if constraints is not None:
         for i in range(n):
-            for _ in range(20):
-                if constraints(samples[i]):
+            if constraints(samples[i]):
+                continue
+            for _ in range(max_redraws):
+                candidate = scale(rng.random(d))
+                if constraints(candidate):
+                    samples[i] = candidate
                     break
-                samples[i] *= 0.95
-            if not constraints(samples[i]):
+            else:
                 samples[i] = 0.5 * (lb + ub)
 
     return samples
@@ -371,6 +700,10 @@ def fit_with_delay_grid(
     tau_values: np.ndarray,
     seed:       Optional[int] = None,
     interp_method: str      = "linear",
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:  Optional[AifConfig] = None,
+    relax_cfg:Optional[RelaxationConfig] = None,
+    
 ) -> "DelayedFitResult":
     """
     Grid search over AIF time delays, fitting the full kinetic model
@@ -394,6 +727,10 @@ def fit_with_delay_grid(
                  e.g. np.arange(-10, 31, 2.0)
                  Positive = AIF arrives later
                  Negative = AIF arrives earlier
+                 
+    wx_model, aif_cfg, relax_cfg : forwarded to fit_single_voxel at
+                 each tau. See fit_single_voxel / _validate_wx_compatibility
+                 for requirements when wx_model is not None.
 
     Returns
     -------
@@ -411,7 +748,8 @@ def fit_with_delay_grid(
     for tau in tau_values:
         shifted_aif      = shift_aif(aif, tau, time_var, acq, method=interp_method)
         per_tau[float(tau)] = fit_single_voxel(
-            sig, shifted_aif, time_var, model, acq, subject, cfg, seed
+            sig, shifted_aif, time_var, model, acq, subject, cfg, seed,
+            wx_model=wx_model, aif_cfg=aif_cfg, relax_cfg=relax_cfg,
         )
 
     best_tau = min(per_tau, key=lambda t: per_tau[t].cost)
@@ -423,6 +761,8 @@ def fit_with_delay_grid(
         per_tau     = per_tau,
         success     = per_tau[best_tau].success,
         fit_mode    = "grid",
+        wx_params     = per_tau[best_tau].wx_params,
+        wx_model_name = per_tau[best_tau].wx_model_name,
     )
 
 
@@ -443,6 +783,9 @@ def fit_with_delay_continuous(
     tau_p0:   float          =   0.0,
     seed:     Optional[int]  = None,
     interp_method: str      = "linear",
+    wx_model: Optional[WaterExchangeModelSpec] = None,
+    aif_cfg:  Optional[AifConfig] = None,
+    relax_cfg:Optional[RelaxationConfig] = None,
 ) -> "DelayedFitResult":
     """
     Fit kinetic model with tau as a continuous free parameter optimised
@@ -463,63 +806,27 @@ def fit_with_delay_continuous(
     tau_lb : lower bound for tau  (s).  Negative = allow earlier arrival.
     tau_ub : upper bound for tau  (s).
     tau_p0 : initial guess for tau  (s).  0 = no delay.
-
+    
+    wx_model, aif_cfg, relax_cfg : forwarded to fit_single_voxel at
+                 each tau. See fit_single_voxel / _validate_wx_compatibility
+                 for requirements when wx_model is not None.
     Returns
     -------
     DelayedFitResult
     """
     from dce_mri.config import DelayedFitResult
-
-    # ── Build augmented bounds and p0 ────────────────────────────────
-    lb_aug = np.append(model.lb, tau_lb)
-    ub_aug = np.append(model.ub, tau_ub)
-    p0_aug = np.append(model.p0, tau_p0)
-
-    # tau spans zero so never log-sample it — keep model's log_dims
-    log_dims_aug = list(model.log_dims) if model.log_dims else []
-    # tau is the last dimension — do not add to log_dims
-
-    # ── Build augmented constraints ───────────────────────────────────
-    # original constraints apply to kinetic params only (all but last)
-    def constraints_aug(p_aug):
-        if model.constraints is not None:
-            return model.constraints(p_aug[:-1])
-        return True
-
-    # ── Build residual function ───────────────────────────────────────
-    def _make_delayed_model_fn(base_model_fn, aif_, time_var_, acq_, method_):
-        """
-        Wrap base_model_fn to accept [*theta_kin, tau] and shift AIF
-        internally before calling base_model_fn.
-        """
-        def delayed_fn(theta_aug, t, _aif_ignored):
-            tau_val     = float(theta_aug[-1])
-            theta_kin   = theta_aug[:-1]
-            shifted_aif = shift_aif(aif_, tau_val, time_var_, acq_, method = method_)
-            return base_model_fn(theta_kin, t, shifted_aif)
-        return delayed_fn
-
-    delayed_model_fn = _make_delayed_model_fn(
-        model.fn, aif, time_var, acq, interp_method
+    
+    aug_spec = build_delay_augmented_spec(
+        model, aif, time_var, acq,
+        tau_lb=tau_lb, tau_ub=tau_ub, tau_p0=tau_p0,
+        interp_method=interp_method, wx_model=wx_model,
     )
-
-    # ── Build augmented KineticModelSpec ──────────────────────────────
-    aug_spec = KineticModelSpec(
-        name        = model.name + "_delay",
-        fn          = delayed_model_fn,
-        param_names = (*model.param_names, "tau"),
-        lb          = lb_aug,
-        ub          = ub_aug,
-        p0          = p0_aug,
-        constraints = constraints_aug,
-        log_dims    = tuple(log_dims_aug) if log_dims_aug else None,
-    )
-
     # ── Run standard fitter on augmented spec ─────────────────────────
     # Pass the original aif as dummy — delayed_model_fn ignores it
     # and uses the closed-over aif internally
     result = fit_single_voxel(
-        sig, aif, time_var, aug_spec, acq, subject, cfg, seed
+        sig, aif, time_var, aug_spec, acq, subject, cfg, seed,
+        wx_model=wx_model, aif_cfg=aif_cfg, relax_cfg=relax_cfg,
     )
 
     best_tau    = float(result.params[-1])
@@ -532,6 +839,8 @@ def fit_with_delay_continuous(
         per_tau     = {},        # not applicable for continuous mode
         success     = result.success,
         fit_mode    = "continuous",
+        wx_params     = result.wx_params,
+        wx_model_name = result.wx_model_name,
     )
 
 def _fit_concentration_curve(
@@ -692,3 +1001,83 @@ def _fit_concentration_curve_with_delay_continuous(
         success     = best_status > 0,
         fit_mode    = "continuous",
     )
+
+# in fitting.py, near the other public/internal fitting functions
+
+def call_fitter(
+    sig_v:        np.ndarray,
+    aif:          np.ndarray,
+    time_var:     np.ndarray,
+    model:        KineticModelSpec,
+    acq:          AcquisitionConfig,
+    subject:      SubjectConfig,
+    fitting_cfg:  FittingConfig,
+    fit_mode_cfg: "FitModeConfig",
+    seed:         Optional[int] = None,
+) -> dict:
+    """
+    Dispatch to the correct fitter based on fit_mode_cfg.mode, and
+    return a normalized flat dict — used by volume.py's chunked
+    parallel processing so it never needs to know about the different
+    result types each fitter returns.
+    """
+    mode = fit_mode_cfg.mode
+
+    if mode == "standard":
+        result = fit_single_voxel(
+            sig_v, aif, time_var, model, acq, subject, fitting_cfg, seed=seed
+        )
+    elif mode == "dispersed":
+        result = fit_dispersed_gkm(
+            sig_v, aif, time_var, acq, subject, fitting_cfg,
+            n_levels=fit_mode_cfg.n_levels, seed=seed
+        )
+    elif mode == "delay_grid":
+        result = fit_with_delay_grid(
+            sig_v, aif, time_var, model, acq, subject, fitting_cfg,
+            fit_mode_cfg.tau_values,
+            interp_method=fit_mode_cfg.interp_method, seed=seed
+        )
+    elif mode == "delay_continuous":
+        result = fit_with_delay_continuous(
+            sig_v, aif, time_var, model, acq, subject, fitting_cfg,
+            tau_lb=fit_mode_cfg.tau_lb,
+            tau_ub=fit_mode_cfg.tau_ub,
+            tau_p0=fit_mode_cfg.tau_p0,
+            interp_method=fit_mode_cfg.interp_method,
+            seed=seed
+        )
+    else:
+        raise ValueError(f"Unknown fit mode: {mode!r}")
+
+    return normalize_fit_result(result, mode)
+
+
+def normalize_fit_result(result, mode: str) -> dict:
+    """
+    Flatten any fit result type (VoxelFitResult, DispersedGKMResult,
+    DelayedFitResult) into a common dict — used by volume.py for IPC
+    across worker processes, and usable anywhere else a uniform
+    result shape is convenient.
+    """
+    if mode == "standard":
+        return {
+            "params":  result.params,
+            "cost":    result.cost,
+            "success": result.success,
+        }
+    elif mode == "dispersed":
+        return {
+            "params":     result.best_params,
+            "cost":       result.best_cost,
+            "success":    result.success,
+            "best_level": result.best_level,
+        }
+    else:  # delay_grid or delay_continuous
+        return {
+            "params":   result.best_params,
+            "cost":     result.best_cost,
+            "success":  result.success,
+            "best_tau": result.best_tau,
+        }
+
