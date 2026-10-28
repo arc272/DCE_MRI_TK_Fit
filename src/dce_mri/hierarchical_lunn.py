@@ -248,6 +248,7 @@ def fit_stage2(
     Psi0: Optional[np.ndarray] = None,
     correct_p1: bool = True,
     theta_sweeps: int = 1,
+    names: Optional[Sequence[str]] = None,
 ) -> Stage2Result:
     """
     Gibbs / Metropolis-within-Gibbs for
@@ -264,6 +265,10 @@ def fit_stage2(
                  exists only to show a test has power to detect that.
     theta_sweeps: independence-MH passes over all lesions per Gibbs sweep.
                   Raise it when acceptance is low.
+    names      : names for the D coordinates of theta, used by summary(). The
+                 default is THETA_NAMES at D = 4 and theta0..theta{D-1}
+                 otherwise -- never a 4-element tuple at D != 4, which would
+                 make summary() drop coordinates without saying so.
 
     Draws are Gibbs-exact for B and Sigma given theta, and Metropolis for
     theta given B, Sigma -- so n_tune still matters and R-hat should be
@@ -279,6 +284,11 @@ def fit_stage2(
     P = X.shape[1]
     if len(coef_names) != P:
         coef_names = tuple([*coef_names] + [f"coef{p}" for p in range(len(coef_names), P)])
+    if names is None:
+        names = (THETA_NAMES if D == len(THETA_NAMES)
+                 else tuple(f"theta{j}" for j in range(D)))
+    elif len(names) != D:
+        raise ValueError(f"names has {len(names)} entries, expected D = {D}")
     nu0 = (D + 2) if nu0 is None else int(nu0)
     Psi0 = np.eye(D) if Psi0 is None else np.asarray(Psi0, float)
 
@@ -347,6 +357,7 @@ def fit_stage2(
         # n_prop counts proposals PER LESION (one per lesion per sweep)
         accept=n_acc / max(n_prop, 1),
         n_distinct=np.array([len(v) for v in visited]),
+        names=tuple(names),
         coef_names=tuple(coef_names),
         meta=dict(sids=s1.sids, L=L, K=K, D=D, P=P, correct_p1=bool(correct_p1),
                   n_draws=n_keep, n_tune=n_tune, thin=thin, seed=seed,

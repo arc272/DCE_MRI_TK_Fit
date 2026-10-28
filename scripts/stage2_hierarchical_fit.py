@@ -6,12 +6,53 @@ stage2_hierarchical_fit.py
 Lunn et al. (2013) two-stage hierarchical fit -- STAGE 2 -- on the clean
 subset of a completed stage-1 run:
 
-    TCXM + fixed delay + SSM3 (tau_i free, tau_b fixed at 5 ms)
-    theta_i = (logit ve, logit vp, log fp, log ps, log tau_i)
     theta_i ~ N(X_i B, Sigma),   X_i = [1, malignant_i (, size_i)]
     B ~ N(0, TAU0^2),  Sigma ~ InverseWishart(NU0, PSI0)
 
 so B[0] is the benign population mean and B[1] is malignant - benign.
+
+THREE STAGE-1 MODELS, ONE SCRIPT.  MODEL picks which parameter set is pooled:
+
+    MODEL                     stage-1 fit                 theta_i
+    ----------------------------------------------------------------------
+    "tcxm"                    TCXM, no AIF delay          (logit ve, logit vp,
+                                                           log fp, log ps)
+    "tcxm_delay"              TCXM + AIF delay sampled    + scaled-logit
+                              jointly                       tau_delay
+    "tcxm_fixeddelay_taui"    TCXM + FIXED delay + SSM3   + log tau_i
+                              (tau_i free, tau_b 5 ms)
+
+MODEL = "auto" (the default) reads param_names out of the first
+{sid}_draws.npz in RUN_DIR and picks the match, so pointing RUN_DIR at a
+different stage-1 run is the whole change. Name a model explicitly to refuse
+anything else. Both can be set from the shell without editing this file:
+
+    STAGE2_MODEL=tcxm STAGE2_RUN_DIR=/path/to/run python stage2_hierarchical_fit.py
+
+Only the parameter set differs. fit_stage2 is dimension-agnostic, so the Lunn
+correction, every diagnostic, every sensitivity analysis and every plot below
+run unchanged on all three; the per-model knowledge lives in two places and
+nowhere else:
+
+    MODEL_SPECS   the stage-1 settings that are NOT recorded in the npz and so
+                  must be declared -- prior_choices, delay bounds, tau_i
+                  bounds. Step 3 is what catches a wrong declaration.
+    COORDS        one Coord per coordinate of theta, carrying its transform
+                  to the population scale, its inverse for display, and the
+                  change-of-variables term its log p_1 needs. Those three have
+                  to agree or the Lunn correction is silently wrong, which is
+                  why they are defined together.
+
+Adding a fourth model is a MODEL_SPECS entry plus, if it introduces a new kind
+of parameter, a branch in build_coords.
+
+A note on the delay. tau_delay is bounded (stage-1 DELAY_BOUNDS) and it enters
+the Gaussian population through a scaled logit by default, so the population
+can never put mass where stage 1 saved no draws -- the same treatment ve and
+vp get. Set delay_scale = "linear" in MODEL_SPECS to model the delay
+directly in seconds instead: physically the more natural scale, but then the
+bounds bite, and step 7 and fig 1 report how much mass sits outside them, the
+same way they do for the tau_i ceiling.
 
 Steps -- each prints what it did, so the log is the record of the run:
 
@@ -63,8 +104,9 @@ Steps -- each prints what it did, so the log is the record of the run:
                       biology.
 
 Plots (PLOTS = True; each ends in plt.show()):
-    fig 1  posterior of the group difference, per parameter, + the tau_i
-           population against the stage-1 ceiling
+    fig 1  posterior of the group difference, per parameter, + one panel per
+           coordinate that can escape its stage-1 bounds (the tau_i ceiling,
+           or a delay modelled directly in seconds; none for "tcxm")
     fig 2  K-sensitivity: M - B and population SD against K
     fig 3  weight diagnostics and the degenerate-set forest plot
     fig 4  Ktrans / E contrasts and within-lesion vs population correlation
@@ -77,11 +119,11 @@ Plots (PLOTS = True; each ends in plt.show()):
            the joint Mahalanobis check, every statistic standardised, the
            p-values, and per-lesion RMS |z| against Kish ESS
 
-UNITS.  Every plot axis for ve, vp, fp, ps and tau_i is LINEAR and in natural
-units -- ve and vp dimensionless, fp and ps in 1/min, tau_i in s (or k_io in
-1/s if TAU_I_AS_RATE). The FIT is untouched: it still runs on
-(logit ve, logit vp, log fp, log ps, log tau_i), which is where the Gaussian
-population model lives. Only the display changes, and every natural-unit
+UNITS.  Every plot axis is LINEAR and in natural units -- ve and vp
+dimensionless, fp and ps in 1/min, tau_i in s (or k_io in 1/s if
+TAU_I_AS_RATE), tau_delay in s. The FIT is untouched: it still runs on the
+modelling scale each Coord declares, which is where the Gaussian population
+model lives. Only the display changes, and every natural-unit
 number is formed by transforming each posterior draw and then summarising --
 never by transforming a summary, which would be a different quantity.
 Because the transform is nonlinear, these are population MEDIANS, not means.
@@ -96,9 +138,10 @@ Note on the degeneracy flag: the old rule (n_distinct < 20) is RUN-LENGTH
 DEPENDENT -- at 100k draws no lesion can fail it however starved its weights
 are. Kish ESS is the length-independent measure and is what KISH_MIN uses.
 
-Known library issue handled here: fit_stage2 does not pass `names` into
-Stage2Result, which defaults to the four 4-D names, so summary() silently
-drops tau_i. This script sets res.names after every fit.
+fit_stage2 used not to pass `names` into Stage2Result, so at D = 5 its
+summary() silently dropped the fifth coordinate -- the fix check_17 asked for
+(a `names` argument, and a D-correct default) is now in hierarchical_lunn, and
+this script passes THETA_NAMES explicitly on every fit.
 """
 
 
@@ -107,6 +150,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
@@ -117,17 +161,87 @@ from dce_mri import hierarchical_lunn as hl
 # =============================================================================
 # SETTINGS
 # =============================================================================
-RUN_DIR = ("/mnt/labspace/users/allison/fastMRI_data/lesion_bayes_results/"
-           "run_20261021_160427")
+RUN_DIR = os.environ.get("STAGE2_RUN_DIR") or (
+    "/mnt/labspace/users/allison/fastMRI_data/lesion_bayes_results/"
+    "run_20261021_160427")
 OUT_DIR = None                     # None -> RUN_DIR/stage2_<timestamp>
 
-PARAMS = ("ve", "vp", "fp", "ps", "tau_i")
-THETA_NAMES = ("logit_ve", "logit_vp", "log_fp", "log_ps", "log_tau_i")
+# --- WHICH STAGE-1 MODEL ------------------------------------------------------
+# The one switch that picks the parameter set. Everything downstream -- the
+# Lunn correction, fit_stage2, every diagnostic and every sensitivity analysis
+# -- is dimension-agnostic and follows from it.
+#
+#   "tcxm"                  TCXM, no AIF delay
+#                           theta = (logit ve, logit vp, log fp, log ps)
+#   "tcxm_delay"            TCXM + AIF delay sampled jointly
+#                           theta = (..., scaled-logit tau_delay)
+#   "tcxm_fixeddelay_taui"  TCXM + FIXED delay + SSM3 (tau_i free, tau_b fixed)
+#                           theta = (..., log tau_i)
+#
+# "auto" reads param_names out of the first {sid}_draws.npz in RUN_DIR and
+# picks the entry whose parameter list matches. Name a model explicitly to
+# refuse anything else -- worth doing for a run you intend to publish, so a
+# stage-1 directory swapped by mistake fails loudly instead of being fitted.
+#
+# Both settings may be overridden from the shell without editing this file:
+#     STAGE2_MODEL=tcxm STAGE2_RUN_DIR=/path/to/run python stage2_hierarchical_fit.py
+MODEL = os.environ.get("STAGE2_MODEL", "auto")
 
-# --- MUST match the stage-1 run (fit_lesions_bayes_wx_fixedtau.py) ----------
-PRIOR_CHOICES = {"rates": "uniform", "volfrac": "flat_masked", "tau": "flat"}
-TAU_I_BOUNDS = (0.01, 1.5)         # s, relax_cfg.tau_i_lb / tau_i_ub
-TAU_B_FIXED = 0.005                # s, only used to rebuild the prior objects
+# --- per-model stage-1 settings ----------------------------------------------
+# prior_choices, delay_bounds and tau_i_bounds MUST match the stage-1 run that
+# produced RUN_DIR. They are not recorded in the npz, so they cannot be
+# detected -- step 3 (PRE-FLIGHT) is what catches a mismatch, by rebuilding the
+# package's own prior objects and comparing log p_1 at REAL saved draws. The
+# defaults below are the ones the matching stage-1 script ships with:
+#
+#   tcxm                  <- fit_lesions_bayes_nodelay.py  (FIT_DELAY = False)
+#   tcxm_delay            <- fit_lesions_bayes.py          (delay_mode joint)
+#   tcxm_fixeddelay_taui  <- fit_lesions_bayes_wx_fixedtau.py
+#
+# delay_scale decides how tau_delay enters the GAUSSIAN population model. The
+# names and the reasoning are check_17_stage2_5d.py's, which verifies both:
+#   "logit"   scaled logit onto the stage-1 delay bounds, w = (tau - lb) /
+#             (ub - lb). Log is impossible -- the delay's lower bound is 0 --
+#             and the logit is unbounded, so the population can never put mass
+#             where stage 1 saved no draws. The delay's prior is uniform, so
+#             log p_1 keeps log w + log(1 - w) and the Lunn correction is
+#             LOAD-BEARING on this coordinate. The default.
+#   "linear"  the delay in seconds, modelled directly. Physically the more
+#             natural scale (delays add), and log p_1 is then flat there, so
+#             the correction has no power on it -- but theta stays BOUNDED, so
+#             a group whose mean sits near a bound has population mass with no
+#             stage-1 draws to land on. Step 7 and fig 1 report that mass when
+#             this is chosen, the same way they do for the tau_i ceiling.
+MODEL_SPECS = {
+    "tcxm": dict(
+        label="TCXM (no AIF delay)",
+        extra=(),
+        delay_mode="none",
+        wx=False,
+        prior_choices={"rates": "uniform", "volfrac": "flat_masked"},
+    ),
+    "tcxm_delay": dict(
+        label="TCXM + joint AIF delay",
+        extra=("tau_delay",),
+        delay_mode="joint",
+        wx=False,
+        prior_choices={"rates": "loguniform", "volfrac": "beta"},
+        delay_bounds=(0.0, 25.0),      # s, BayesConfig.delay_bounds
+        delay_scale="logit",
+    ),
+    "tcxm_fixeddelay_taui": dict(
+        label="TCXM + fixed delay + SSM3 (tau_i free, tau_b fixed)",
+        extra=("tau_i",),
+        delay_mode="fixed",
+        wx=True,
+        prior_choices={"rates": "uniform", "volfrac": "flat_masked",
+                       "tau": "flat"},
+        delay_fixed=5.0,               # s, BayesConfig.delay_fixed
+        delay_bounds=(0.0, 25.0),      # only used to rebuild the prior objects
+        tau_i_bounds=(0.01, 1.5),      # s, relax_cfg.tau_i_lb / tau_i_ub
+        tau_b_fixed=0.005,             # s, only used to rebuild the layout
+    ),
+}
 
 # --- inclusion rule: fix this BEFORE looking at stage-2 results --------------
 REQUIRE_QC_PASS = True             # the stage-1 run's own qc_pass flag
@@ -195,8 +309,183 @@ WORST_N = 12
 TAU_I_AS_RATE = False
 
 # =============================================================================
-D = len(PARAMS)
-SCALE = ("logit", "logit", "log", "log", "log")
+# MODEL RESOLUTION
+# =============================================================================
+# Every coordinate of theta is described by one Coord. Nothing below this point
+# asks which model is running: it asks COORDS. That is what makes the three
+# models one script rather than three.
+#
+# kind decides three things at once, and they have to agree or the Lunn
+# correction is silently wrong:
+#     to_theta    constrained x  ->  population scale theta
+#     natural     theta          ->  the units the plots and tables use
+#     log_jac     log |dx/dtheta|, the change-of-variables term in log p_1
+TCXM_PARAMS = ("ve", "vp", "fp", "ps")
+
+
+@dataclass(frozen=True)
+class Coord:
+    """One coordinate of theta, from the stage-1 draw to the printed label."""
+    name:       str                    # as stored in {sid}_draws.npz
+    theta_name: str                    # on the population (modelling) scale
+    kind:       str                    # logit01 | log | logit_ab | identity
+    lb:         float = np.nan         # constrained bounds (logit_ab needs both)
+    ub:         float = np.nan
+    nat_mul:    float = 1.0            # natural = nat_mul * value
+    invert:     bool = False           # natural = nat_mul / value  (k_io)
+    nat_label:  str = ""
+    nat_short:  str = ""
+    ceiling:    bool = False           # report population mass beyond ub
+
+
+def c_to_theta(c, x):
+    """Constrained value -> population scale."""
+    x = np.asarray(x, float)
+    if c.kind == "logit01":
+        return np.log(x) - np.log1p(-x)
+    if c.kind == "log":
+        return np.log(x)
+    if c.kind == "logit_ab":
+        u = (x - c.lb) / (c.ub - c.lb)
+        return np.log(u) - np.log1p(-u)
+    if c.kind == "identity":
+        return x
+    raise ValueError(f"unknown coordinate kind {c.kind!r}")
+
+
+def c_from_theta(c, th):
+    """Population scale -> constrained value (the inverse of c_to_theta)."""
+    th = np.asarray(th, float)
+    if c.kind == "logit01":
+        return 1.0 / (1.0 + np.exp(-th))
+    if c.kind == "log":
+        return np.exp(th)
+    if c.kind == "logit_ab":
+        return c.lb + (c.ub - c.lb) / (1.0 + np.exp(-th))
+    if c.kind == "identity":
+        return th
+    raise ValueError(f"unknown coordinate kind {c.kind!r}")
+
+
+def c_log_jac(c, x):
+    """log |dx/dtheta| at the CONSTRAINED value x -- the Jacobian of log p_1."""
+    x = np.asarray(x, float)
+    if c.kind == "logit01":
+        return np.log(x) + np.log1p(-x)
+    if c.kind == "log":
+        return np.log(x)
+    if c.kind == "logit_ab":
+        u = (x - c.lb) / (c.ub - c.lb)
+        return np.log(c.ub - c.lb) + np.log(u) + np.log1p(-u)
+    if c.kind == "identity":
+        return np.zeros_like(x)
+    raise ValueError(f"unknown coordinate kind {c.kind!r}")
+
+
+def c_dnat_dtheta(c, th, nat_mul=None, invert=None):
+    """
+    |d natural / d theta|: what a density on the modelling scale must be
+    divided by to be drawn against a natural-unit axis. Built from c_log_jac,
+    so there is one definition of the derivative and a transform added to
+    c_to_theta cannot acquire a stale one here.
+    """
+    nat_mul = c.nat_mul if nat_mul is None else nat_mul
+    invert = c.invert if invert is None else invert
+    x = c_from_theta(c, th)
+    dx = np.exp(c_log_jac(c, x))                       # |dx/dtheta|
+    return (nat_mul / x ** 2 if invert else nat_mul) * dx
+
+
+def detect_model(run_dir):
+    """Read param_names from the first {sid}_draws.npz and name the model."""
+    files = sorted(glob.glob(os.path.join(run_dir, "*_draws.npz")))
+    if not files:
+        raise FileNotFoundError(
+            f"MODEL = 'auto' but no *_draws.npz in {run_dir}; name the model "
+            f"explicitly (one of {sorted(MODEL_SPECS)})")
+    with np.load(files[0], allow_pickle=True) as z:
+        names = [str(n) for n in z["param_names"]]
+    if list(names[:4]) != list(TCXM_PARAMS):
+        raise ValueError(f"{os.path.basename(files[0])} samples {names}; the "
+                         f"first four must be {list(TCXM_PARAMS)}")
+    hits = [k for k, s in MODEL_SPECS.items()
+            if all(e in names for e in s["extra"])
+            and not ({"tau_delay", "tau_i"} - set(s["extra"])) & set(names)]
+    if len(hits) != 1:
+        raise ValueError(f"{os.path.basename(files[0])} samples {names}, which "
+                         f"matches {hits or 'no'} model(s); name one explicitly")
+    print(f"MODEL       : {hits[0]!r} (auto-detected from "
+          f"{os.path.basename(files[0])}: {names})")
+    return hits[0]
+
+
+def build_coords(spec):
+    """The ordered Coord list for one model spec."""
+    coords = [
+        Coord("ve", "logit_ve", "logit01", nat_label="ve", nat_short="ve"),
+        Coord("vp", "logit_vp", "logit01", nat_label="vp", nat_short="vp"),
+        Coord("fp", "log_fp", "log", nat_mul=RATE_TO_PER_MIN,
+              nat_label="fp [1/min]", nat_short="fp"),
+        Coord("ps", "log_ps", "log", nat_mul=RATE_TO_PER_MIN,
+              nat_label="ps [1/min]", nat_short="ps"),
+    ]
+    for e in spec["extra"]:
+        if e == "tau_i":
+            lo, hi = spec["tau_i_bounds"]
+            coords.append(Coord(
+                "tau_i", "log_tau_i", "log", lb=lo, ub=hi,
+                invert=TAU_I_AS_RATE,
+                nat_label=("k_io = 1/tau_i [1/s]" if TAU_I_AS_RATE
+                           else "tau_i [s]"),
+                nat_short="k_io" if TAU_I_AS_RATE else "tau_i",
+                # the stage-1 ceiling is real and the log scale is unbounded
+                # above it, so the Gaussian population can put mass where no
+                # stage-1 draw lives. Step 7 and fig 1 report how much.
+                ceiling=True))
+        elif e == "tau_delay":
+            lo, hi = spec["delay_bounds"]
+            scale = spec.get("delay_scale", "logit")
+            if scale not in ("logit", "linear"):
+                raise ValueError(f"delay_scale {scale!r}: expected 'logit' or "
+                                 "'linear'")
+            logit = scale == "logit"
+            coords.append(Coord(
+                "tau_delay",
+                "logit_tau_delay" if logit else "tau_delay_s",
+                "logit_ab" if logit else "identity", lb=lo, ub=hi,
+                nat_label="tau_delay [s]", nat_short="tau_d",
+                # a scaled logit cannot leave [lb, ub], so there is nothing to
+                # report; modelled directly in seconds, there is.
+                ceiling=not logit))
+        else:
+            raise ValueError(f"no Coord recipe for extra parameter {e!r}")
+    return tuple(coords)
+
+
+if MODEL == "auto":
+    MODEL = detect_model(RUN_DIR)
+if MODEL not in MODEL_SPECS:
+    raise SystemExit(f"MODEL {MODEL!r} is not one of {sorted(MODEL_SPECS)}")
+SPEC = MODEL_SPECS[MODEL]
+COORDS = build_coords(SPEC)
+
+PARAMS = tuple(c.name for c in COORDS)
+THETA_NAMES = tuple(c.theta_name for c in COORDS)
+NAT_LABEL = tuple(c.nat_label for c in COORDS)
+NAT_SHORT = tuple(c.nat_short for c in COORDS)
+D = len(COORDS)
+
+PRIOR_CHOICES = dict(SPEC["prior_choices"])
+DELAY_MODE = SPEC["delay_mode"]
+DELAY_BOUNDS = SPEC.get("delay_bounds", (0.0, 25.0))
+DELAY_FIXED = SPEC.get("delay_fixed", 5.0)
+TAU_I_BOUNDS = SPEC.get("tau_i_bounds")
+TAU_B_FIXED = SPEC.get("tau_b_fixed", 0.005)
+CEILING_J = tuple(j for j, c in enumerate(COORDS) if c.ceiling)
+# width of the coordinate-name column in every printed table, so the longest
+# name this model has (logit_tau_delay, 15) does not shunt the row sideways
+NW = max(12, max(len(n) for n in THETA_NAMES) + 1)
+
 K_LOAD = max((K,) + tuple(K_GRID)) if RUN_K_SENSITIVITY else K
 
 
@@ -206,40 +495,25 @@ def _bool(v):
     return str(v).strip().lower() in ("true", "1", "yes", "t")
 
 
-def to_theta5(X):
-    """(..., 5) constrained (ve, vp, fp, ps, tau_i) -> population scale."""
+def to_theta_all(X):
+    """(..., D) constrained draws in PARAMS order -> the population scale."""
     X = np.asarray(X, float)
     out = np.empty_like(X)
-    for j, s in enumerate(SCALE):
-        x = X[..., j]
-        out[..., j] = (np.log(x) - np.log1p(-x)) if s == "logit" else np.log(x)
+    for j, c in enumerate(COORDS):
+        out[..., j] = c_to_theta(c, X[..., j])
     return out
 
 
 def natural(theta, j):
     """
-    Population-scale value -> natural units, elementwise and monotone:
-        ve, vp   sigmoid           (volume fraction, dimensionless)
-        fp, ps   exp x 60          [1/min]   (stored in s^-1)
-        tau_i    exp               [s]       -- or 1/exp = k_io [1/s] when
-                                                TAU_I_AS_RATE
-    Monotone (decreasing for the k_io case), so quantiles map through it
-    directly; a mean does not, which is why everything below transforms
-    PER DRAW and then takes the median.
+    Population-scale value -> natural units for coordinate j, elementwise and
+    MONOTONE (decreasing only for the k_io case, where invert is set). Monotone
+    means quantiles map straight through it; a mean does not, which is why
+    everything below transforms PER DRAW and then summarises.
     """
-    theta = np.asarray(theta, float)
-    if SCALE[j] == "logit":
-        return 1.0 / (1.0 + np.exp(-theta))
-    if PARAMS[j] in ("fp", "ps"):
-        return np.exp(theta) * RATE_TO_PER_MIN
-    if PARAMS[j] == "tau_i" and TAU_I_AS_RATE:
-        return np.exp(-theta)
-    return np.exp(theta)
-
-
-NAT_LABEL = ("ve", "vp", "fp [1/min]", "ps [1/min]",
-             "k_io = 1/tau_i [1/s]" if TAU_I_AS_RATE else "tau_i [s]")
-NAT_SHORT = ("ve", "vp", "fp", "ps", "k_io" if TAU_I_AS_RATE else "tau_i")
+    c = COORDS[j]
+    v = c_from_theta(c, theta)
+    return c.nat_mul / v if c.invert else c.nat_mul * v
 
 
 def nat_group_draws(B, j):
@@ -274,25 +548,52 @@ def nat_spread_draws(B, SD, j, q=1.645):
             np.minimum(lo_m, hi_m), np.maximum(lo_m, hi_m))
 
 
-def make_log_p1(choices, lb4, ub4, tau_bounds):
+def make_log_p1(choices, lb4, ub4):
     """
-    Stage-1 prior density on the 5-D population scale, from constrained draws.
-    First four coordinates: hl.log_p1_theta exactly. tau_i under "flat"
-    (log-uniform): p_x(tau) ~ 1/tau, times the Jacobian dtau/dlog tau = tau,
-    is constant -- so it adds nothing, but out-of-bounds draws still get -inf.
-    Same algebra as check_17's log_p1_theta5, which T0 verified to 1e-14.
+    Stage-1 prior density on the D-dimensional population scale, evaluated at
+    CONSTRAINED draws. This is the only thing stage 2 needs from stage 1
+    besides the draws themselves (Lunn Eq. 7), and getting it wrong is the one
+    failure stage 2 has that produces plausible-looking output -- which is why
+    step 3 checks it against the package's own prior objects at real draws.
+
+    The first four coordinates are hl.log_p1_theta exactly, so the verified
+    algebra stays the single source of truth. Each extra coordinate adds its
+    own  log p_x(x) + log |dx/dtheta|  on top, and puts -inf outside its
+    stage-1 bounds so an out-of-support draw can never be proposed:
+
+      tau_i, tau = "flat" (log-uniform)
+          p_x(tau) ~ 1/tau against the Jacobian dtau/dlog tau = tau: the two
+          cancel and the density on log tau is FLAT, so the term is 0. Same
+          algebra as check_17's log_p1_theta5, verified to 1e-14.
+      tau_i, tau = "uniform" (linear-uniform)
+          p_x constant, so only the Jacobian survives: + log tau.
+      tau_delay (always uniform on the delay bounds)
+          p_x constant, so again only the Jacobian: 0 on the identity scale,
+          and log(ub - lb) + log u + log1p(-u) on the scaled logit, with
+          u = (tau - lb) / (ub - lb).
+
+    Normalising constants are dropped throughout: stage 2 only ever uses
+    DIFFERENCES of log_p1 within one lesion, where any constant cancels.
     """
-    if choices.get("tau", "flat") != "flat":
-        raise ValueError("only the 'flat' (log-uniform) tau prior is handled; "
-                         f"got {choices.get('tau')!r}")
     base4 = hl.log_p1_theta(choices, lb4, ub4)
-    tlo, thi = tau_bounds
+    extra = [(j, c) for j, c in enumerate(COORDS) if j >= 4]
+    tau_choice = choices.get("tau", "flat")
+    if any(c.name == "tau_i" for _, c in extra) and tau_choice not in ("flat",
+                                                                       "uniform"):
+        raise ValueError("only the 'flat' (log-uniform) and 'uniform' tau "
+                         f"priors are handled; got {tau_choice!r}")
 
     def log_p1(X):
         X = np.asarray(X, float)
         out = base4(X[..., :4])
-        t = X[..., 4]
-        return np.where((t >= tlo) & (t <= thi), out, -np.inf)
+        for j, c in extra:
+            x = X[..., j]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                term = c_log_jac(c, x)
+                if c.name == "tau_i" and tau_choice == "flat":
+                    term = term - np.log(x)          # p_x(tau) ~ 1/tau
+                out = np.where((x >= c.lb) & (x <= c.ub), out + term, -np.inf)
+        return out
 
     return log_p1
 
@@ -403,7 +704,7 @@ def step1_inclusion(run_dir):
                 continue
             ch = np.asarray(z["chains"], float)[:, :, [names.index(p) for p in PARAMS]]
             nvox = float(z["lesion_nvox"]) if "lesion_nvox" in z else np.nan
-        th = to_theta5(ch)
+        th = to_theta_all(ch)
         if not np.all(np.isfinite(th)):
             log[s] = "non-finite draw on the population scale"
             continue
@@ -489,11 +790,20 @@ def step3_preflight(XC, kept, log_p1):
     from dce_mri.bayes_priors import assemble_prior
     from dce_mri.synthetic import make_parker_aif
     from dce_mri.kinetic_models import TCXM
-    from dce_mri.water_exchange import SSM3
     from dce_mri.config import AcquisitionConfig, RelaxationConfig
 
-    relax = RelaxationConfig(fit_tau_b=False, tau_b_fixed=TAU_B_FIXED,
-                             tau_i_lb=TAU_I_BOUNDS[0], tau_i_ub=TAU_I_BOUNDS[1])
+    # Rebuild the stage-1 layout for THIS model. Only three things differ
+    # between the three models -- the delay mode, whether a water-exchange
+    # model contributes tau_i, and which prior blocks therefore exist -- and
+    # all three come out of SPEC, so the comparison below is the same check in
+    # every case.
+    wx = relax = None
+    if SPEC["wx"]:
+        from dce_mri.water_exchange import SSM3
+        wx = SSM3
+        relax = RelaxationConfig(fit_tau_b=False, tau_b_fixed=TAU_B_FIXED,
+                                 tau_i_lb=TAU_I_BOUNDS[0],
+                                 tau_i_ub=TAU_I_BOUNDS[1])
     acq = AcquisitionConfig(TR=4.87, FA=10.0, r1=3.9, nbase=slice(0, 7))
     # the priors depend only on bounds and choices; the AIF/time grid are
     # needed to build a layout and do not enter the prior density
@@ -501,17 +811,27 @@ def step3_preflight(XC, kept, log_p1):
     aif = make_parker_aif(tt, t_arrival=35.0, hematocrit=0.4)
     noise = NOISE_OPTIONS["gauss_marginalized_sigma"]
     cb = BayesConfig(prior_choices=PRIOR_CHOICES, noise="gauss_marginalized_sigma",
-                     delay_mode="fixed", delay_fixed=5.0, delay_bounds=(0.0, 25.0))
+                     delay_mode=DELAY_MODE, delay_fixed=DELAY_FIXED,
+                     delay_bounds=DELAY_BOUNDS)
     lay = build_param_layout(TCXM, cb, aif=aif, time_var=tt, acq=acq,
-                             wx_model=SSM3, relax_cfg=relax)
-    pr = assemble_prior(lay.model, relax, wx_model=SSM3, delay_mode="fixed",
+                             wx_model=wx, relax_cfg=relax)
+    pr = assemble_prior(lay.model, relax, wx_model=wx, delay_mode=DELAY_MODE,
                         n_noise=noise.n_params, noise_names=noise.param_names,
-                        choices=PRIOR_CHOICES, delay_bounds=(0.0, 25.0))
+                        choices=PRIOR_CHOICES, delay_bounds=DELAY_BOUNDS)
     names = list(lay.param_names)
     if names[:D] != list(PARAMS):
-        raise AssertionError(f"layout samples {names}, expected {list(PARAMS)} first")
-    blocks = [b for b in pr.blocks if b.name in ("volfrac", "rates", "tau")]
+        raise AssertionError(f"layout samples {names}, expected {list(PARAMS)} "
+                             f"first -- MODEL {MODEL!r} does not describe "
+                             f"{RUN_DIR}")
+    blocks = [b for b in pr.blocks
+              if b.name in ("volfrac", "rates", "tau", "delay")]
+    print(f"    model {MODEL!r}: {SPEC['label']}")
     print(f"    prior blocks: {[b.name for b in blocks]}   choices {PRIOR_CHOICES}")
+    # the delay-augmented spec carries the delay bounds, so a DELAY_BOUNDS that
+    # disagrees with the stage-1 run shows up as an out-of-support draw below
+    for j, c in enumerate(COORDS[4:], start=4):
+        print(f"    {c.name} bounds [{c.lb:g}, {c.ub:g}]  modelled as "
+              f"{c.theta_name} ({c.kind})")
 
     rng = np.random.default_rng(0)
     pick = rng.choice(len(kept), size=min(PREFLIGHT_LESIONS, len(kept)), replace=False)
@@ -520,9 +840,10 @@ def step3_preflight(XC, kept, log_p1):
     for i in pick:
         X = XC[i][rng.choice(XC.shape[1], size=nd, replace=False)]
         ref = np.array([sum(b.log_pdf(x[list(b.indices)]) for b in blocks) for x in X])
-        jac = (np.log(X[:, 0]) + np.log1p(-X[:, 0]) + np.log(X[:, 1])
-               + np.log1p(-X[:, 1]) + np.log(X[:, 2]) + np.log(X[:, 3])
-               + np.log(X[:, 4]))
+        # the change of variables, coordinate by coordinate -- the same
+        # c_log_jac the script's own log p_1 uses, so a transform added to
+        # build_coords cannot be forgotten here
+        jac = sum(c_log_jac(c, X[:, j]) for j, c in enumerate(COORDS))
         mine = log_p1(X)
         n_inf += int((~np.isfinite(ref)).sum())
         d = mine - (ref + jac)
@@ -535,8 +856,10 @@ def step3_preflight(XC, kept, log_p1):
     ok = (n_inf == 0) and (worst < 1e-8)
     print(f"    -> {'PASS: same density up to a constant' if ok else 'FAIL'}")
     if not ok:
-        raise SystemExit("pre-flight failed: PRIOR_CHOICES / bounds here do not "
-                         "match the prior the stage-1 run used. Fix before fitting.")
+        raise SystemExit(
+            f"pre-flight failed: the PRIOR_CHOICES / bounds in "
+            f"MODEL_SPECS[{MODEL!r}] do not match the prior the stage-1 run "
+            f"used. Fix before fitting.")
 
 
 # =============================================================================
@@ -574,8 +897,8 @@ def fit_many(s1, X, coef_names, n_tune, n_draws, seeds, out_dir=None,
         t0 = time.time()
         r = hl.fit_stage2(s1, design=X, coef_names=coef_names, n_tune=n_tune,
                           n_draws=n_draws, seed=seed, tau0=TAU0, nu0=NU0,
-                          Psi0=PSI0, theta_sweeps=THETA_SWEEPS)
-        r.names = THETA_NAMES                 # library defect: see header
+                          Psi0=PSI0, theta_sweeps=THETA_SWEEPS,
+                          names=THETA_NAMES)
         el = time.time() - t0
         if verbose:
             print(f"    {tag}seed {seed}: {el:6.1f} s   acceptance "
@@ -763,7 +1086,7 @@ def step7_results(fits, s1, X, coef_names, dx, lesion):
     C = np.concatenate([f.corr() for f in fits])            # (n, D, D)
 
     rows = []
-    hdr = (f"    {'coordinate':<12}{'benign mean':>13}{'90% CrI':>22}"
+    hdr = (f"    {'coordinate':<{NW}}{'benign mean':>13}{'90% CrI':>22}"
            f"{'natural':>11}   {'M - B':>8}{'90% CrI':>22}{'ratio':>8}"
            f"{'P(M>B)':>8}   {'pop SD':>7}{'M-B/SD':>8}")
     print(hdr)
@@ -778,7 +1101,7 @@ def step7_results(fits, s1, X, coef_names, dx, lesion):
         ratio = float(np.exp(md))
         p_up = float(np.mean(d > 0))
         ms, ls, hs = q(SD[:, j])
-        print(f"    {nm:<12}{m0:>13.3f} [{l0:>8.3f},{h0:>8.3f}]{nat0:>11.4g}   "
+        print(f"    {nm:<{NW}}{m0:>13.3f} [{l0:>8.3f},{h0:>8.3f}]{nat0:>11.4g}   "
               f"{md:>8.3f} [{ld:>8.3f},{hd:>8.3f}]{ratio:>8.3f}{p_up:>8.3f}   "
               f"{ms:>7.3f}{md / ms:>8.2f}")
         rows.append(dict(coordinate=nm, natural_param=NAT_LABEL[j],
@@ -793,7 +1116,11 @@ def step7_results(fits, s1, X, coef_names, dx, lesion):
     print("    natural = benign population median in natural units "
           "(sigmoid / exp of the mean)")
     print("    ratio   = exp(M - B): ratio of population medians for log "
-          "coordinates, odds ratio for logit ones")
+          "coordinates,")
+    print("              odds ratio for logit ones -- for a scaled logit "
+          "(tau_delay) that")
+    print("              is the odds of its position between its stage-1 "
+          "bounds")
     print("    M-B/SD  = group shift in units of the lesion-to-lesion spread")
 
     # --- the same result in natural units, transformed per draw -------------
@@ -840,24 +1167,40 @@ def step7_results(fits, s1, X, coef_names, dx, lesion):
     print()
     print("    population correlation (posterior median):")
     Cm = np.median(C, axis=0)
-    print("    " + " " * 12 + "".join(f"{n[:10]:>11}" for n in THETA_NAMES))
+    print("    " + " " * NW + "".join(f"{n[:10]:>11}" for n in THETA_NAMES))
     for j, nm in enumerate(THETA_NAMES):
-        print(f"    {nm:<12}" + "".join(f"{Cm[j, k]:>11.2f}" for k in range(D)))
+        print(f"    {nm:<{NW}}" + "".join(f"{Cm[j, k]:>11.2f}" for k in range(D)))
 
-    # tau_i against the stage-1 ceiling
-    from scipy import stats as _st
-    j = THETA_NAMES.index("log_tau_i")
-    ubl = np.log(TAU_I_BOUNDS[1])
+    # Coordinates whose stage-1 bounds the Gaussian population can escape.
+    # A coordinate on a scaled logit cannot (the transform maps the whole real
+    # line into [lb, ub]), so CEILING_J is empty for those and this section
+    # says so rather than printing a vacuous table.
     print()
-    print(f"    tau_i against the stage-1 ceiling of {TAU_I_BOUNDS[1]:g} s:")
-    for lab, mu in (("benign", np.median(B[:, 0, j])),
-                    ("malignant", np.median(B[:, 0, j] + B[:, 1, j]))):
+    if not CEILING_J:
+        print("    no coordinate can leave its stage-1 bounds: every bounded "
+              "one is")
+        print("    modelled on a scale whose range is exactly those bounds, so "
+              "there is")
+        print("    no population mass without stage-1 draws to land on.")
+    for j in CEILING_J:
+        c = COORDS[j]
+        from scipy import stats as _st
         sdj = float(np.median(SD[:, j]))
-        z = (ubl - mu) / sdj
-        print(f"      {lab:<10} population median {np.exp(mu):.3f} s   "
-              f"mass above the ceiling {_st.norm.sf(z) * 100:5.2f}%  (z {z:.2f})")
-    print("      mass above the ceiling has no stage-1 draws to land on, so it")
-    print("      biases that group's mean DOWN and compresses the population SD")
+        print(f"    {c.name} against its stage-1 bounds "
+              f"[{c.lb:g}, {c.ub:g}]:")
+        for lab, mu in (("benign", float(np.median(B[:, 0, j]))),
+                        ("malignant", float(np.median(B[:, 0, j] + B[:, 1, j])))):
+            z_hi = (c_to_theta(c, c.ub) - mu) / sdj
+            z_lo = (c_to_theta(c, c.lb) - mu) / sdj
+            print(f"      {lab:<10} population median "
+                  f"{c_from_theta(c, mu):.3f}   "
+                  f"mass above the ceiling {_st.norm.sf(z_hi) * 100:5.2f}% "
+                  f"(z {z_hi:.2f})   below the floor "
+                  f"{_st.norm.cdf(z_lo) * 100:5.2f}% (z {z_lo:.2f})")
+        print("      mass outside the bounds has no stage-1 draws to land on, "
+              "so it pulls")
+        print("      that group's mean back inside and compresses the "
+              "population SD")
 
     # per-lesion shrinkage: stage-1 median vs stage-2 median
     L = s1.draws.shape[0]
@@ -907,12 +1250,12 @@ def step8_k_sensitivity(s1_full, X, coef_names):
     ks = pd.concat(out, ignore_index=True)
 
     print()
-    print(f"    {'K':>7}{'coordinate':<12}{'M - B':>9}{'MCSE':>8}"
+    print(f"    {'K':>7}{'coordinate':<{NW}}{'M - B':>9}{'MCSE':>8}"
           f"{'90% CrI':>20}{'pop SD':>9}{'MCSE':>8}{'P(M>B)':>8}")
     for Kv in K_GRID:
         sub = ks[ks["K"] == Kv]
         for _, r in sub.iterrows():
-            print(f"    {Kv:>7}{r['coordinate']:<12}{r['diff_median']:>9.3f}"
+            print(f"    {Kv:>7}{r['coordinate']:<{NW}}{r['diff_median']:>9.3f}"
                   f"{r['diff_mcse']:>8.3f} [{r['diff_q05']:>7.3f},"
                   f"{r['diff_q95']:>7.3f}]{r['pop_sd_median']:>9.3f}"
                   f"{r['pop_sd_mcse']:>8.3f}{r['p_malignant_higher']:>8.3f}")
@@ -927,7 +1270,7 @@ def step8_k_sensitivity(s1_full, X, coef_names):
     print()
     print("    drift across K, in units of the quantity's own Monte-Carlo error")
     print("    (> 3 means the change is real and not chain noise):")
-    print(f"      {'coordinate':<12}{'M-B drift':>11}{'in MCSE':>9}"
+    print(f"      {'coordinate':<{NW}}{'M-B drift':>11}{'in MCSE':>9}"
           f"{'popSD drift':>13}{'in MCSE':>9}  verdict")
     verdicts = {}
     for nm in THETA_NAMES:
@@ -939,7 +1282,7 @@ def step8_k_sensitivity(s1_full, X, coef_names):
         rd, rs = dd / max(md, 1e-12), ds / max(ms, 1e-12)
         v = "FINITE-K TREND" if max(rd, rs) > 3 else "stable"
         verdicts[nm] = v
-        print(f"      {nm:<12}{dd:>11.4f}{rd:>9.1f}{ds:>13.4f}{rs:>9.1f}  {v}")
+        print(f"      {nm:<{NW}}{dd:>11.4f}{rd:>9.1f}{ds:>13.4f}{rs:>9.1f}  {v}")
     print("    A trend means the reported value depends on how many stage-1")
     print("    draws you happened to hand over; raise K until it flattens.")
     return ks, fits_by_K, kish_by_K
@@ -982,7 +1325,7 @@ def step9_degenerate_sensitivity(s1_full, X, coef_names, kish_ref, sids,
     a = summarize_fits(fits_all, label="all lesions")
     b = summarize_fits(fits_sub, label=f"Kish >= {KISH_MIN:g}")
     print()
-    print(f"    {'coordinate':<12}{'M-B all':>10}{'M-B kept':>10}{'change':>9}"
+    print(f"    {'coordinate':<{NW}}{'M-B all':>10}{'M-B kept':>10}{'change':>9}"
           f"{'in MCSE':>9}{'P all':>8}{'P kept':>8}")
     rows = []
     for nm in THETA_NAMES:
@@ -990,7 +1333,7 @@ def step9_degenerate_sensitivity(s1_full, X, coef_names, kish_ref, sids,
         rb = b[b["coordinate"] == nm].iloc[0]
         ch = rb["diff_median"] - ra["diff_median"]
         mc = max(ra["diff_mcse"], rb["diff_mcse"], 1e-12)
-        print(f"    {nm:<12}{ra['diff_median']:>10.3f}{rb['diff_median']:>10.3f}"
+        print(f"    {nm:<{NW}}{ra['diff_median']:>10.3f}{rb['diff_median']:>10.3f}"
               f"{ch:>9.3f}{ch / mc:>9.1f}{ra['p_malignant_higher']:>8.3f}"
               f"{rb['p_malignant_higher']:>8.3f}")
         rows.append(dict(coordinate=nm, diff_all=ra["diff_median"],
@@ -1014,7 +1357,7 @@ def step9_degenerate_sensitivity(s1_full, X, coef_names, kish_ref, sids,
     if len(big):
         print("    !! the starved lesions are moving these coordinates:")
         for _, r in big.iterrows():
-            print(f"       {r['coordinate']:<12} change {r['change']:+.3f} "
+            print(f"       {r['coordinate']:<{NW}} change {r['change']:+.3f} "
                   f"= {r['change_in_mcse']:+.1f} MCSE")
     else:
         print("    no coordinate moves by more than 3 MCSE: the starved "
@@ -1306,7 +1649,7 @@ def step11_ppc(fits, s1, X, lesion):
         n = L if lab == "all lesions" else int(keep.sum())
         print()
         print(f"    {lab}  ({n} lesions)")
-        print(f"      {'statistic':<16}{'coordinate':<12}{'fitted':>9}"
+        print(f"      {'statistic':<16}{'coordinate':<{NW}}{'fitted':>9}"
               f"{'reference':>11}{'90% ref':>19}{'2-sided p':>11}"
               f"{'effect':>8}")
         for _, r in sub.iterrows():
@@ -1314,7 +1657,7 @@ def step11_ppc(fits, s1, X, lesion):
                                 and r["p_two_sided"] < 0.05)
                     or (np.isfinite(r["discrepancy_sd"])
                         and abs(r["discrepancy_sd"]) > 2) else "")
-            print(f"      {r['statistic']:<16}{r['coordinate']:<12}"
+            print(f"      {r['statistic']:<16}{r['coordinate']:<{NW}}"
                   f"{r['observed']:>9.3f}{r['rep_median']:>11.3f}"
                   f" [{r['rep_q05']:>7.3f},{r['rep_q95']:>7.3f}]"
                   f"{r['p_two_sided']:>11.3f}{r['discrepancy_sd']:>8.2f}{flag}")
@@ -1371,20 +1714,25 @@ def _finish(fig, name, out_dir):
 
 def plot_fig1_differences(fits, summ, out_dir):
     """
-    Posterior of M - B per parameter IN NATURAL UNITS, plus tau_i against the
-    stage-1 ceiling. The difference is formed per draw as
+    Posterior of M - B per parameter IN NATURAL UNITS, plus one panel per
+    coordinate that can escape its stage-1 bounds (tau_i, or a delay modelled
+    directly in seconds). The difference is formed per draw as
 
         natural(benign mean + difference) - natural(benign mean)
 
     i.e. the difference of the two population MEDIANS in natural units. The
     modelling-scale difference is kept in the title (its effect size in
     population SDs is the scale-free number).
+
+    The grid follows D, so the 4-, 5- and 6-panel models all lay out sensibly.
     """
     import matplotlib.pyplot as plt
     from scipy import stats as st
     B = np.concatenate([f.B for f in fits])
     SD = np.concatenate([f.sd() for f in fits])
-    fig, ax = plt.subplots(2, 3, figsize=(14, 7.5))
+    n_panel = D + len(CEILING_J)
+    ncol = int(np.ceil(n_panel / 2))
+    fig, ax = plt.subplots(2, ncol, figsize=(4.7 * ncol, 7.5), squeeze=False)
     axes = ax.ravel()
     for j, nm in enumerate(THETA_NAMES):
         a = axes[j]
@@ -1406,37 +1754,49 @@ def plot_fig1_differences(fits, summ, out_dir):
         if j == 0:
             a.legend(fontsize=7, frameon=False)
 
-    # tau_i population against the stage-1 ceiling. The densities are Gaussian
-    # on the log tau_i scale -- which is where the model lives -- but the axis
-    # is drawn in natural units, so the curve is the transformed density.
-    a = axes[5]
-    j = THETA_NAMES.index("log_tau_i")
-    mu_b = float(np.median(B[:, 0, j]))
-    mu_m = float(np.median(B[:, 0, j] + B[:, 1, j]))
-    sdj = float(np.median(SD[:, j]))
-    ubl = np.log(TAU_I_BOUNDS[1])                       # the bound, log scale
-    zs = np.linspace(min(mu_b, mu_m) - 4 * sdj, max(ubl, mu_m + 4 * sdj), 600)
-    xs = natural(zs, j)
-    for mu, lab, c in ((mu_b, "benign", "#4878a8"), (mu_m, "malignant", "#c0392b")):
-        pdf = st.norm.pdf(zs, mu, sdj)
-        # density in the displayed variable: divide by |dx/dz| = |x| here
-        pdf_x = pdf / np.abs(xs)
-        a.plot(xs, pdf_x, color=c, lw=1.8,
-               label=f"{lab}: {natural(mu, j):.3g}, "
-                     f"{st.norm.sf((ubl - mu) / sdj) * 100:.1f}% beyond the bound")
-        a.fill_between(xs, 0, pdf_x, where=zs > ubl, color=c, alpha=0.3)
-    xb = float(natural(ubl, j))
-    a.axvline(xb, color="k", lw=1.5)
-    a.text(xb, 0.97, f" stage-1 bound {xb:.3g} ", transform=a.get_xaxis_transform(),
-           ha="right", va="top", rotation=90, fontsize=7.5)
-    a.set_xlim(float(np.min(xs)), float(np.max(xs)))
-    a.set_title(f"{NAT_SHORT[4]} population vs the stage-1 bound\n"
-                "shaded mass has no stage-1 draws to land on", fontsize=9)
-    a.set_xlabel(NAT_LABEL[4])
-    a.set_yticks([])
-    a.legend(fontsize=7, frameon=False, loc="upper left")
-    fig.suptitle("fig 1  posterior of the group difference, natural units",
-                 fontsize=11)
+    # One panel per coordinate that can escape its stage-1 ceiling. The
+    # densities are Gaussian on the MODELLING scale -- which is where the
+    # population model lives -- but the axis is drawn in natural units, so the
+    # curve plotted is the transformed density: p(x) = p(theta) / |dx/dtheta|,
+    # and |dx/dtheta| comes from the coordinate's own Jacobian rather than a
+    # hard-coded exp.
+    for panel, j in enumerate(CEILING_J):
+        c = COORDS[j]
+        a = axes[D + panel]
+        mu_b = float(np.median(B[:, 0, j]))
+        mu_m = float(np.median(B[:, 0, j] + B[:, 1, j]))
+        sdj = float(np.median(SD[:, j]))
+        ubl = float(c_to_theta(c, c.ub))                # the bound, model scale
+        zs = np.linspace(min(mu_b, mu_m) - 4 * sdj,
+                         max(ubl, mu_m + 4 * sdj), 600)
+        xs = natural(zs, j)
+        # the density in the DISPLAYED variable is the density on the
+        # modelling scale divided by |d natural / d theta|
+        dxdz = np.abs(c_dnat_dtheta(c, zs))
+        for mu, lab, col in ((mu_b, "benign", "#4878a8"),
+                             (mu_m, "malignant", "#c0392b")):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pdf_x = st.norm.pdf(zs, mu, sdj) / dxdz
+            a.plot(xs, pdf_x, color=col, lw=1.8,
+                   label=f"{lab}: {natural(mu, j):.3g}, "
+                         f"{st.norm.sf((ubl - mu) / sdj) * 100:.1f}% beyond "
+                         "the bound")
+            a.fill_between(xs, 0, pdf_x, where=zs > ubl, color=col, alpha=0.3)
+        xb = float(natural(ubl, j))
+        a.axvline(xb, color="k", lw=1.5)
+        a.text(xb, 0.97, f" stage-1 bound {xb:.3g} ",
+               transform=a.get_xaxis_transform(),
+               ha="right", va="top", rotation=90, fontsize=7.5)
+        a.set_xlim(float(np.min(xs)), float(np.max(xs)))
+        a.set_title(f"{c.nat_short} population vs the stage-1 bound\n"
+                    "shaded mass has no stage-1 draws to land on", fontsize=9)
+        a.set_xlabel(c.nat_label)
+        a.set_yticks([])
+        a.legend(fontsize=7, frameon=False, loc="upper left")
+    for k in range(n_panel, axes.size):
+        axes[k].axis("off")
+    fig.suptitle(f"fig 1  posterior of the group difference, natural units  "
+                 f"--  {SPEC['label']}", fontsize=11)
     _finish(fig, "fig1_group_difference.png", out_dir)
 
 
@@ -1909,12 +2269,16 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     print(f"stage-1 run : {RUN_DIR}")
     print(f"output      : {out_dir}")
+    print(f"model       : {MODEL!r}  --  {SPEC['label']}")
+    print(f"theta       : {list(THETA_NAMES)}")
+    print(f"priors      : {PRIOR_CHOICES}   delay_mode {DELAY_MODE!r}")
 
     from dce_mri.kinetic_models import TCXM
     lb4, ub4 = np.asarray(TCXM.lb, float), np.asarray(TCXM.ub, float)
-    print(f"TCXM bounds : lb {lb4}  ub {ub4}   tau_i {TAU_I_BOUNDS}")
+    extra_b = "  ".join(f"{c.name} [{c.lb:g}, {c.ub:g}]" for c in COORDS[4:])
+    print(f"TCXM bounds : lb {lb4}  ub {ub4}   {extra_b}")
     print("              (compare with 'TCXM bounds at run time' in the stage-1 log)")
-    log_p1 = make_log_p1(PRIOR_CHOICES, lb4, ub4, TAU_I_BOUNDS)
+    log_p1 = make_log_p1(PRIOR_CHOICES, lb4, ub4)
 
     kept, dx, draws, inc = step1_inclusion(RUN_DIR)
     inc.to_csv(os.path.join(out_dir, "inclusion.csv"), index=False)
@@ -1964,7 +2328,10 @@ def main():
     summ.to_csv(os.path.join(out_dir, "stage2_summary.csv"), index=False)
     lesion.to_csv(os.path.join(out_dir, "stage2_lesions.csv"), index=False)
     dg.to_csv(os.path.join(out_dir, "stage2_convergence.csv"), index=False)
-    settings = dict(RUN_DIR=RUN_DIR, PARAMS=PARAMS, THETA_NAMES=THETA_NAMES,
+    settings = dict(RUN_DIR=RUN_DIR, MODEL=MODEL, MODEL_LABEL=SPEC["label"],
+                    DELAY_MODE=DELAY_MODE, DELAY_BOUNDS=list(DELAY_BOUNDS),
+                    COORD_KINDS=[c.kind for c in COORDS],
+                    PARAMS=PARAMS, THETA_NAMES=THETA_NAMES,
                     PRIOR_CHOICES=PRIOR_CHOICES, TAU_I_BOUNDS=TAU_I_BOUNDS,
                     REQUIRE_QC_PASS=REQUIRE_QC_PASS, POP_ESS_MIN=POP_ESS_MIN,
                     EXCLUDE=list(EXCLUDE), K=K, K_LOAD=K_LOAD,
